@@ -48,7 +48,6 @@ constexpr uint8_t EndSceneBillboardsPrologue[] = {0xFF, 0x89, 0x0C, 0x01, 0x04, 
 constexpr size_t RenderSceneDepth = 0x4010C;            // BeginScene nesting counter
 constexpr uintptr_t SoftVertices = 0x50AA90;            // RenderVertexSoft[], stride 0x30
 constexpr uintptr_t TLVertices = 0x77E448;              // D3DTLVERTEX[], stride 0x20, filled by DrawTerrainPolygon
-constexpr size_t PolygonNumVertices = 0x14;             // u32
 constexpr size_t PolygonFlags = 0x30;                   // i16
 constexpr uint16_t TileWater = 2;
 
@@ -93,6 +92,7 @@ static bool s_f10_was_down = false;
 
 static IDirect3DDevice9 *s_dev = nullptr;
 static uint8_t *s_current_poly = nullptr; // set only while the game is inside DrawTerrainPolygon
+static uint32_t s_current_n = 0;          // vertex count after clipping (DrawTerrainPolygon arg, not Polygon::uNumVertices)
 static bool s_poly_captured = false;
 
 struct WaterVertex { float x, y, z, rhw; uint32_t diffuse; float u, v, su, sv; };
@@ -111,9 +111,9 @@ static DWORD s_last_log = 0;
 
 // ---- capture ---------------------------------------------------------------------------------
 
-static void capture_water_poly(uint8_t *poly)
+static void capture_water_poly()
 {
-	const uint32_t n = *reinterpret_cast<uint32_t *>(poly + mm7::PolygonNumVertices);
+	const uint32_t n = s_current_n;
 	if (n < 3 || n > 64 || !s_dev)
 		return;
 	const auto *tl = reinterpret_cast<const mm7::TLVertex *>(mm7::TLVertices);
@@ -315,6 +315,7 @@ static DrawTerrainPolygonFn s_orig_draw_terrain_polygon = nullptr;
 static void __fastcall hook_draw_terrain_polygon(void *self, void *edx, uint32_t n, uint8_t *poly, void *tex, int transparent, int clamp)
 {
 	s_current_poly = poly;
+	s_current_n = n;
 	s_poly_captured = false;
 	s_orig_draw_terrain_polygon(self, edx, n, poly, tex, transparent, clamp);
 	s_current_poly = nullptr;
@@ -357,7 +358,7 @@ static bool on_draw(command_list *cmd, uint32_t, uint32_t, uint32_t, uint32_t)
 	case Mode::Effect:
 		if (!s_poly_captured) {
 			s_poly_captured = true;
-			capture_water_poly(s_current_poly);
+			capture_water_poly();
 		}
 		return true; // redrawn later by draw_water()
 	case Mode::HideWater:
