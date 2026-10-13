@@ -4,7 +4,7 @@ Usage: mm7input.py KEY:SECONDS [KEY:SECONDS ...]   e.g. up:1.5 left:0.5"""
 import fcntl, os, struct, sys, time
 
 KEYS = {'up': 103, 'left': 105, 'right': 106, 'down': 108, 'space': 57, 'enter': 28,
-        'esc': 1, 'pgup': 104, 'pgdn': 109, 'home': 102, 'end': 107}
+        'esc': 1, 'f9': 67, 'f10': 68, 'f11': 87, 'f12': 88, 'pgup': 104, 'pgdn': 109, 'home': 102, 'end': 107}
 UI_SET_EVBIT, UI_SET_KEYBIT, UI_DEV_CREATE, UI_DEV_DESTROY = 0x40045564, 0x40045565, 0x5501, 0x5502
 EV_SYN, EV_KEY = 0, 1
 

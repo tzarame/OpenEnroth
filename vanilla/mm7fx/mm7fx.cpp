@@ -3,9 +3,9 @@
 //
 // v2 (water proof of concept):
 //   - detour Render::DrawTerrainPolygon: while it runs we know which terrain tile is being drawn;
-//   - water tiles (Polygon::flags & 2) are not drawn in place: their TL vertices + texture are captured;
+//   - water tiles (Polygon::flags & 2) are drawn as usual and their TL vertices + texture are captured;
 //   - detour Render::DrawBillboards_And_MaybeRenderSpecialEffects_And_EndScene: before billboards/UI,
-//     copy the frame and redraw captured water with our pixel shader (screen-space reflection + ripples);
+//     copy the frame and overlay captured water with our pixel shader (screen-space reflection + ripples);
 //   - horizon line is derived from the captured vertices (world/view/screen), no FOV guessing.
 //   F10 cycles: water effect -> vanilla -> hide water -> hide all terrain.
 #include <reshade.hpp>
@@ -140,6 +140,16 @@ static void capture_water_poly()
 		s_water_verts.push_back({t.x * sx - 0.5f, t.y * sy - 0.5f, t.z, t.rhw, t.diffuse, t.u, t.v, t.x / mm7::ScreenW, t.y / mm7::ScreenH});
 	}
 	s_water_polys.push_back(wp);
+	static DWORD last = 0;
+	if (GetTickCount() - last > 3000 && (n > 4 || !wp.tex || (tl[0].diffuse & 0xFFFFFF) < 0x202020)) {
+		last = GetTickCount();
+		DWORD op = 0, a1 = 0, a2 = 0;
+		s_dev->GetTextureStageState(0, D3DTSS_COLOROP, &op);
+		s_dev->GetTextureStageState(0, D3DTSS_COLORARG1, &a1);
+		s_dev->GetTextureStageState(0, D3DTSS_COLORARG2, &a2);
+		log_info("mm7fx dbg: odd water poly n=%u tex=%p diffuse0=%08x spec0=%08x uv0=(%.2f,%.2f) rhw0=%.5f z0=%.5f colorop=%lu args=%lu,%lu",
+			n, (void *)wp.tex, tl[0].diffuse, tl[0].specular, tl[0].u, tl[0].v, tl[0].rhw, tl[0].z, op, a1, a2);
+	}
 
 	// projection fit samples (view: x = forward depth, z = vertical)
 	for (uint32_t i = 0; i < n; ++i) {
@@ -290,8 +300,12 @@ static void draw_water()
 	s_dev->SetPixelShaderConstantF(0, params, 1);
 	s_dev->SetFVF(WaterFVF);
 	s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
-	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+	// Our z is not bit-identical to dxwrapper's converted TL vertices; pull water slightly towards the camera.
+	// D16 depth: 1 LSB = 1.5e-5. ponytail: fixed bias, tune if water z-fights at far distances.
+	const float bias = -0.0002f;
+	s_dev->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD *>(&bias));
 	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
@@ -374,7 +388,9 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 			s_poly_captured = true;
 			capture_water_poly();
 		}
-		return true; // redrawn later by draw_water()
+		// Keep the vanilla draw: it fills color+depth where invisible depth-only faces (e.g. ship hulls
+		// below the waterline) later hide water. draw_water() overlays with ZFUNC LESSEQUAL, no z-write.
+		return false;
 	case Mode::HideWater:
 		return true;
 	default:
