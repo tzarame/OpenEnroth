@@ -764,6 +764,7 @@ static void bb_on_draw()
 		s_bb_verts.resize(p.first);
 }
 
+constexpr float MirrorMaxDist = 7000; // forward depth beyond which geometry is not mirrored
 static bool mirror_wanted()
 {
 	return s_mode == Mode::Effect || s_mode == Mode::DebugSolid || s_mode == Mode::DebugReflection;
@@ -866,7 +867,11 @@ static void mirror_end(const uint8_t *poly)
 		}
 		lv->n += n;
 		s_mir_water_cnt += n;
-	} else if (s_mir_have_verts && s_mir_cur_tex) {
+	} else if (s_mir_have_verts && s_mir_cur_tex && [&] {
+		// far geometry reflects tiny and under ripples: leave it to the sky reflection (big perf win)
+		for (uint32_t i = 0; i < n; ++i)
+			if (s_mir_cur[i].x < MirrorMaxDist) return true;
+		return false; }()) {
 		s_mir_polys.push_back({s_mir_cur_tex, static_cast<uint32_t>(s_mir_verts.size()), n});
 		s_mir_cur_tex = nullptr; // reference moves to the poly
 		s_mir_verts.insert(s_mir_verts.end(), s_mir_cur, s_mir_cur + n);
@@ -1846,7 +1851,7 @@ static void fog_render()
 // Toggle: Effect mode only, and mm7fx_shadows.txt (0 off, 1 on, 2 debug: the factor as grey over the 3D view, no fog).
 
 namespace shcfg { // MM7 units: a terrain tile is 512
-constexpr int MapSize = 2048;          // shadow map texels per side
+constexpr int MapSize = 1024;          // shadow map texels per side
 constexpr float Extent = 6000;         // world units covered by the map (perpendicular to the sun)
 constexpr float Ahead = 1500;          // map centre this far ahead of the camera (horizontally)
 constexpr float DepthRange = 20000;    // light-space depth +- around the centre
