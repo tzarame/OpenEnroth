@@ -1221,8 +1221,12 @@ static void draw_water_batch()
 		s_dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
 		s_dev->SetSamplerState(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 		s_dev->SetSamplerState(4, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-		s_dev->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
-		s_dev->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+		// CLAMP: with WRAP the linear alpha at a tile's edge mixed in the opposite edge of the shore texture
+		// (thin brown dashed line along tile borders)
+		s_dev->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+		s_dev->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+		s_dev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+		s_dev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 		s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 		s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
 		for (const auto &p : s_water_polys) {
