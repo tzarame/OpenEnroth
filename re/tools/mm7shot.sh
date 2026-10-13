@@ -2,7 +2,7 @@
 # Screenshot only the MM7 window (KDE Wayland): KWin script -> geometry, spectacle full shot -> crop -> delete full shot.
 # Usage: mm7shot.sh [out.png]
 set -e
-"$(dirname "$0")/mm7focus.sh"; sleep 0.4  # raise the game window so nothing covers it
+[ "${MM7_RAISE:-0}" = 1 ] && { "$(dirname "$0")/mm7focus.sh"; sleep 0.4; }  # MM7_RAISE=1: raise the game window (steals focus)
 out=${1:-/tmp/claude-1000/mm7.png}
 tmp=$(mktemp -d)
 cat > "$tmp/geo.js" <<'JS'
