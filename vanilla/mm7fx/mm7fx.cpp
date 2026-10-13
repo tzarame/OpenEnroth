@@ -424,7 +424,12 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : 
 	float3 base = tex2D(waterTex, uv + rip * 4.0 * m).rgb * color.rgb; // m = 0: exactly the base texture
 	float fresnel = saturate(1.0 - below * 3.5);
 	float k = extra.x * (0.35 + 0.55 * fresnel) * inside * m;
-	float3 c = lerp(base, refl * float3(0.85, 0.92, 1.0), k);
+	// harmonise the reflection with the water texture: take its hue from the water colour at this texel and let
+	// the texture's light/dark wave pattern modulate the reflection's brightness
+	float lb = dot(base, float3(0.299, 0.587, 0.114));
+	float3 tint = base / max(lb, 0.05);
+	float3 wrefl = refl * lerp(float3(1.0, 1.0, 1.0), tint, 0.45) * (0.65 + 0.9 * lb);
+	float3 c = lerp(base, wrefl, k);
 	float3 dbg = shore.x > 0.5 ? float3(0.0, 1.0, 1.0) : float3(1.0, 0.0, 1.0);
 	return float4(lerp(c, dbg, extra.w), 1.0); // extra.w = 1: debug solid magenta (water) / cyan (shore)
 }
