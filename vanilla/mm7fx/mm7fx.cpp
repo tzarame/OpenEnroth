@@ -1165,7 +1165,11 @@ static void draw_water_batch()
 	// same depth setup the game used for its water (it may be a W-buffer)
 	s_dev->SetRenderState(D3DRS_ZENABLE, s_mode == Mode::DebugSolid ? D3DZB_FALSE : s_game_zenable); // debug: no depth test
 	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, s_game_zwrite);
-	s_dev->SetRenderState(D3DRS_ZFUNC, s_game_zfunc);
+	s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+	// the vanilla water stays underneath as a crack filler at the very same depth: always win against it
+	const float zbias = -0.0002f, zslope = -1.0f;
+	s_dev->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD *>(&zbias));
+	s_dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *reinterpret_cast<const DWORD *>(&zslope));
 	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
@@ -1967,7 +1971,9 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 		if (!s_scene_ready || s_init_failed)
 			return false; // effect not available yet (first frame): vanilla water
 		s_poly_captured = true; // vertices captured when DrawTerrainPolygon returns
-		return true; // drawn by draw_water_batch() at the end of the scene; vanilla passes skipped
+		// The vanilla base pass of a water layer stays as an underlay: it fills the 1px cracks between our
+		// polygons. Its lightmap/fog passes and the alpha-blended shore layer are skipped (we redraw those).
+		return !(s_poly_draws == 1 && s_poly_tex);
 	case Mode::HideWater:
 		return true;
 	default:
