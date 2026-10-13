@@ -1925,16 +1925,21 @@ constexpr float AoStrength = 0.6f;
 constexpr float AoMaxPx = 40;          // screen radius cap, game px (640x480)
 constexpr float AoCosBias = 0.15f;     // ignore occluders flatter than this (cosine to the normal)
 constexpr float AoFadeStart = 3000, AoFadeEnd = 6000;
+constexpr float SunStepCos = 0.99985f; // light basis kept until the sun moved more than ~1 degree
+constexpr float CamHoldRot = 1e-3f;    // camera fit noise: basis entries / position (world units) changing less
+constexpr float CamHoldPos = 2.0f;     // than this keep the previous frame's values
 }
 
 static int s_sh_mode = 1; // mm7fx_shadows.txt
 static IDirect3DTexture9 *s_sh_map = nullptr, *s_sh_half = nullptr;
 static IDirect3DSurface9 *s_sh_map_ds = nullptr;
-static IDirect3DVertexShader9 *s_sh_vs_map = nullptr, *s_sh_vs_quad = nullptr;
+static IDirect3DVertexShader9 *s_sh_vs_map = nullptr, *s_sh_vs_quad = nullptr, *s_sh_vs_full = nullptr;
 static IDirect3DPixelShader9 *s_sh_ps_map = nullptr, *s_sh_ps_half = nullptr, *s_sh_ps_apply = nullptr;
 static IDirect3DStateBlock9 *s_sh_state = nullptr;
 static bool s_sh_init_failed = false;
 static std::vector<MirrorVertex> s_sh_bb; // billboards turned to the sun
+static float s_sh_sun[3] = {}, s_sh_r[3][3] = {}, s_sh_cam[3] = {}; // held sun direction and camera (see shadows_render)
+static bool s_sh_sun_ok = false, s_sh_cam_ok = false;
 
 static bool shadows_wanted() { return s_mode == Mode::Effect && s_sh_mode != 0; }
 static bool shadows_debug() { return shadows_wanted() && s_sh_mode == 2; }
@@ -1971,6 +1976,7 @@ float4 fade : register(c12); // shadow fade start, 1 / length, AO fade start, 1 
 float4 aoc : register(c13);  // AO radius, strength, max radius (game px), cosine bias
 float4 col : register(c14);  // rgb: shadow colour, w: debug
 float4 atest : register(c15);// x = 1: alpha-test tex0
+float4 view : register(c16); // game 3D view rect: left, top, right, bottom
 
 struct MOut { float4 pos : POSITION; float2 uv : TEXCOORD0; float z : TEXCOORD1; };
 MOut vs_map(float3 pos : POSITION, float2 uv : TEXCOORD0)
@@ -1992,6 +1998,11 @@ float4 vs_quad(float3 pos : POSITION) : POSITION // pos.xy in game screen coords
 	return float4((pos.xy * gf.xy + gf.zw + off.xy) * mul.xy, 0.0, 1.0);
 }
 
+float4 vs_full(float3 pos : POSITION) : POSITION // pos.xy = clip coords: whole target
+{
+	return float4(pos.xy, 0.0, 1.0);
+}
+
 float2 to_game(float2 px)
 {
 	float2 ndc = float2((px.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (px.y - vp.y) / vp.w * 2.0);
@@ -2009,8 +2020,10 @@ float3 view_at(float2 px, float d) { return d * view_dir(to_game(px)); }
 float4 ps_half(float2 vpos : VPOS) : COLOR
 {
 	float2 px = vpos * 2.0 + 0.5; // full-res pixel 2 * vpos
+	float2 gv = to_game(px);
 	float d = depth_at(px);
-	if (d <= 0.0)
+	// drawn over the whole half-res target (the game's viewport can be larger than the target): skip outside the view
+	if (d <= 0.0 || gv.x < view.x || gv.y < view.y || gv.x > view.z || gv.y > view.w)
 		return float4(1.0, 1.0, 0.0, 1.0);
 	float3 P = view_at(px, d);
 	// normal from the neighbour on the side with the smaller depth step (no smearing across silhouettes)
@@ -2108,10 +2121,10 @@ static bool init_shadow_resources()
 	auto compile = dc ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(dc, "D3DCompile")) : nullptr;
 	if (!compile)
 		return false;
-	ID3DBlob *blobs[5] = {};
-	const char *const entries[5][2] = {{"vs_map", "vs_3_0"}, {"ps_map", "ps_3_0"}, {"vs_quad", "vs_3_0"}, {"ps_half", "ps_3_0"}, {"ps_apply", "ps_3_0"}};
+	ID3DBlob *blobs[6] = {};
+	const char *const entries[6][2] = {{"vs_map", "vs_3_0"}, {"ps_map", "ps_3_0"}, {"vs_quad", "vs_3_0"}, {"ps_half", "ps_3_0"}, {"ps_apply", "ps_3_0"}, {"vs_full", "vs_3_0"}};
 	HRESULT hr = S_OK;
-	for (int i = 0; i < 5 && SUCCEEDED(hr); ++i) {
+	for (int i = 0; i < 6 && SUCCEEDED(hr); ++i) {
 		ID3DBlob *err = nullptr;
 		hr = compile(s_sh_src, sizeof(s_sh_src) - 1, "mm7fx_shadows", nullptr, nullptr, entries[i][0], entries[i][1], 0, 0, &blobs[i], &err);
 		if (FAILED(hr))
@@ -2124,6 +2137,7 @@ static bool init_shadow_resources()
 	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexShader(code(2), &s_sh_vs_quad);
 	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(code(3), &s_sh_ps_half);
 	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(code(4), &s_sh_ps_apply);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexShader(code(5), &s_sh_vs_full);
 	for (ID3DBlob *b : blobs)
 		if (b) b->Release();
 	if (SUCCEEDED(hr)) hr = s_dev->CreateStateBlock(D3DSBT_ALL, &s_sh_state);
@@ -2146,7 +2160,7 @@ static void shadows_release_resources()
 	                     reinterpret_cast<IUnknown **>(&s_sh_map_ds), reinterpret_cast<IUnknown **>(&s_sh_vs_map),
 	                     reinterpret_cast<IUnknown **>(&s_sh_vs_quad), reinterpret_cast<IUnknown **>(&s_sh_ps_map),
 	                     reinterpret_cast<IUnknown **>(&s_sh_ps_half), reinterpret_cast<IUnknown **>(&s_sh_ps_apply),
-	                     reinterpret_cast<IUnknown **>(&s_sh_state)}) {
+	                     reinterpret_cast<IUnknown **>(&s_sh_state), reinterpret_cast<IUnknown **>(&s_sh_vs_full)}) {
 		if (*p) (*p)->Release();
 		*p = nullptr;
 	}
@@ -2174,20 +2188,45 @@ static void shadows_render(const float sun[3])
 		}
 	}
 
+	// Stability: the sun moves every game minute and the fitted camera jitters a little every frame; both would move
+	// the shadow-map texel grid against the world (crawling edges). The sun is held until it moved > ~1 degree, the
+	// camera basis/position until they changed by more than the fit noise.
+	if (!s_sh_sun_ok || sun[0] * s_sh_sun[0] + sun[1] * s_sh_sun[1] + sun[2] * s_sh_sun[2] < shcfg::SunStepCos) {
+		std::memcpy(s_sh_sun, sun, sizeof(s_sh_sun));
+		s_sh_sun_ok = true;
+	}
+	{
+		const float *fr[3] = {s_fog_rx, s_fog_ry, s_fog_rz};
+		float dr = 0, dp = 0;
+		for (int a = 0; a < 3; ++a) {
+			dp = std::max(dp, std::fabs(s_fog_cam[a] - s_sh_cam[a]));
+			for (int k = 0; k < 3; ++k)
+				dr = std::max(dr, std::fabs(fr[a][k] - s_sh_r[a][k]));
+		}
+		if (!s_sh_cam_ok || dr > shcfg::CamHoldRot || dp > shcfg::CamHoldPos) {
+			for (int a = 0; a < 3; ++a) {
+				std::memcpy(s_sh_r[a], fr[a], sizeof(s_sh_r[a]));
+				s_sh_cam[a] = s_fog_cam[a];
+			}
+			s_sh_cam_ok = true;
+		}
+	}
+	sun = s_sh_sun;
+
 	// light basis in world space: ls toward the sun, lx horizontal, ly = ls x lx
 	const double ls[3] = {sun[0], sun[1], sun[2]};
 	const double hl = std::sqrt(ls[0] * ls[0] + ls[1] * ls[1]);
 	const double lx[3] = {hl > 1e-6 ? -ls[1] / hl : 1, hl > 1e-6 ? ls[0] / hl : 0, 0};
 	const double ly[3] = {ls[1] * lx[2] - ls[2] * lx[1], ls[2] * lx[0] - ls[0] * lx[2], ls[0] * lx[1] - ls[1] * lx[0]};
-	const float *r[3] = {s_fog_rx, s_fog_ry, s_fog_rz}; // view images of world X, Y, Z: world_k = cam_k + dot(r[k], view)
+	const float *r[3] = {s_sh_r[0], s_sh_r[1], s_sh_r[2]}; // view images of world X, Y, Z: world_k = cam_k + dot(r[k], view)
 	// map centre ahead of the camera, snapped to whole texels across the map (no shimmering while moving)
 	double fw[2] = {r[0][0], r[1][0]};
 	const double fl = std::sqrt(fw[0] * fw[0] + fw[1] * fw[1]);
 	const double ahead = fl > 1e-3 ? shcfg::Ahead / fl : 0;
-	const double c[3] = {s_fog_cam[0] + fw[0] * ahead, s_fog_cam[1] + fw[1] * ahead, s_fog_cam[2]};
+	const double c[3] = {s_sh_cam[0] + fw[0] * ahead, s_sh_cam[1] + fw[1] * ahead, s_sh_cam[2]};
 	const double texel = double(shcfg::Extent) / shcfg::MapSize;
 	auto dot3 = [](const double *a, const double *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
-	const double cam[3] = {s_fog_cam[0], s_fog_cam[1], s_fog_cam[2]};
+	const double cam[3] = {s_sh_cam[0], s_sh_cam[1], s_sh_cam[2]};
 	const double origin[3] = {std::floor(dot3(lx, c) / texel) * texel, std::floor(dot3(ly, c) / texel) * texel, dot3(ls, c)};
 	float rows[12];
 	const double *axes[3] = {lx, ly, ls};
@@ -2204,7 +2243,7 @@ static void shadows_render(const float sun[3])
 	// (camera-facing) are no longer behind it
 	s_sh_bb.clear();
 	if (sun_f > 0) {
-		const float *up = s_fog_rz;
+		const float *up = s_sh_r[2];
 		float h[3] = {-up[0] * up[1], 1 - up[1] * up[1], -up[2] * up[1]}; // camera left, horizontal
 		float sh[3] = {sunv[0], sunv[1], sunv[2]};
 		const float su = sh[0] * up[0] + sh[1] * up[1] + sh[2] * up[2];
@@ -2238,7 +2277,7 @@ static void shadows_render(const float sun[3])
 	}
 
 	const int32_t *rr = reinterpret_cast<const int32_t *>(mm7::RenderRect);
-	const float k[16 * 4] = {
+	const float k[17 * 4] = {
 		s_fog_proj[0], s_fog_proj[1], s_fog_proj[2], s_fog_proj[3],
 		s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1],
 		s_fog_dxw[0], s_fog_dxw[1], s_fog_dxw[2], s_fog_dxw[3],
@@ -2252,14 +2291,15 @@ static void shadows_render(const float sun[3])
 		shcfg::FadeStart, 1.0f / (shcfg::FadeEnd - shcfg::FadeStart), shcfg::AoFadeStart, 1.0f / (shcfg::AoFadeEnd - shcfg::AoFadeStart),
 		shcfg::AoRadius, shcfg::AoStrength, shcfg::AoMaxPx, shcfg::AoCosBias,
 		shcfg::ShadowColor[0], shcfg::ShadowColor[1], shcfg::ShadowColor[2], shadows_debug() ? 1.0f : 0.0f,
-		0, 0, 0, 0}; // atest
+		0, 0, 0, 0, // atest
+		float(rr[0]), float(rr[1]), float(rr[2]), float(rr[3])};
 
 	s_sh_state->Capture();
 	IDirect3DSurface9 *prev_rt = nullptr, *prev_ds = nullptr, *surf = nullptr;
 	s_dev->GetRenderTarget(0, &prev_rt);
 	s_dev->GetDepthStencilSurface(&prev_ds);
-	s_dev->SetVertexShaderConstantF(0, k, 16);
-	s_dev->SetPixelShaderConstantF(0, k, 16);
+	s_dev->SetVertexShaderConstantF(0, k, 17);
+	s_dev->SetPixelShaderConstantF(0, k, 17);
 	s_dev->SetVertexDeclaration(s_fog_decl); // MirrorVertex
 	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
@@ -2315,14 +2355,15 @@ static void shadows_render(const float sun[3])
 	s_dev->SetRenderTarget(0, surf);
 	surf->Release();
 	s_dev->SetDepthStencilSurface(nullptr);
-	const D3DVIEWPORT9 hvp = {s_fog_vp.X / 2, s_fog_vp.Y / 2, std::min<DWORD>((s_fog_vp.Width + 1) / 2, hw - s_fog_vp.X / 2),
-	                          std::min<DWORD>((s_fog_vp.Height + 1) / 2, hh - s_fog_vp.Y / 2), 0.0f, 1.0f};
+	// whole target: the game's viewport may be larger than its render target (GrayFace's logical space), so halving
+	// it does not give the half-res mapping; ps_half maps every texel itself and skips those outside the 3D view
+	const D3DVIEWPORT9 hvp = {0, 0, hw, hh, 0.0f, 1.0f};
 	s_dev->SetViewport(&hvp);
 	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0x00FFFF00, 1.0f, 0); // AO 1, visible, depth 0
 	s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
 	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-	s_dev->SetVertexShader(s_sh_vs_quad);
+	s_dev->SetVertexShader(s_sh_vs_full);
 	s_dev->SetPixelShader(s_sh_ps_half);
 	s_dev->SetTexture(0, s_fog_depth_tex);
 	s_dev->SetTexture(1, s_sh_map);
@@ -2330,9 +2371,8 @@ static void shadows_render(const float sun[3])
 	s_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
 	s_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
 	s_dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-	const float l = float(rr[0]), tp = float(rr[1]), rt = float(rr[2]), b = float(rr[3]);
-	const MirrorVertex quad[4] = {{l, tp, 0, 0, 0, 0}, {rt, tp, 0, 0, 0, 0}, {rt, b, 0, 0, 0, 0}, {l, b, 0, 0, 0, 0}};
-	s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(MirrorVertex));
+	const MirrorVertex full[4] = {{-1, 1, 0, 0, 0, 0}, {1, 1, 0, 0, 0, 0}, {1, -1, 0, 0, 0, 0}, {-1, -1, 0, 0, 0, 0}};
+	s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, full, sizeof(MirrorVertex));
 
 	// 3. multiply into the game's 3D view (debug: replace)
 	s_dev->SetRenderTarget(0, s_fog_rt);
@@ -2342,8 +2382,11 @@ static void shadows_render(const float sun[3])
 	s_dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_DESTCOLOR);
 	s_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ZERO);
 	s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x7);
+	s_dev->SetVertexShader(s_sh_vs_quad);
 	s_dev->SetPixelShader(s_sh_ps_apply);
 	s_dev->SetTexture(1, nullptr);
+	const float l = float(rr[0]), tp = float(rr[1]), rt = float(rr[2]), b = float(rr[3]);
+	const MirrorVertex quad[4] = {{l, tp, 0, 0, 0, 0}, {rt, tp, 0, 0, 0, 0}, {rt, b, 0, 0, 0, 0}, {l, b, 0, 0, 0, 0}};
 	s_dev->SetTexture(2, s_sh_half);
 	s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(MirrorVertex));
 
