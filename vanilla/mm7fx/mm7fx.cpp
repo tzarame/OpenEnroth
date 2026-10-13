@@ -368,7 +368,10 @@ sampler2D layerTex : register(s1);    // POINT: colour without bleeding from tra
 sampler2D layerTexLin : register(s4); // LINEAR: smooth alpha edge
 float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
 {
-	float4 t = float4(tex2D(layerTex, uv).rgb, tex2D(layerTexLin, uv).a);
+	float4 lin = tex2D(layerTexLin, uv);
+	// filtered colour inside the layer, unfiltered only at the transparent edge (where filtering bled the
+	// transparent texels' colour into an outline)
+	float4 t = float4(lerp(tex2D(layerTex, uv).rgb, lin.rgb, smoothstep(0.85, 1.0, lin.a)), lin.a);
 	// sampled with POINT filtering (see the overlay pass): the transparent texels' colour must not bleed into
 	// the edge (linear filtering gave dark or bright outlines whatever the blend mode)
 	return float4(t.rgb * color.rgb, t.a); // vertex alpha is not meaningful for terrain
