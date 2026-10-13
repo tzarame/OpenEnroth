@@ -62,6 +62,7 @@ constexpr uintptr_t SoftVertices = 0x50AA90;            // RenderVertexSoft[], s
 constexpr uintptr_t TLVertices = 0x77E448;              // D3DTLVERTEX[], stride 0x20, filled by DrawTerrainPolygon
 constexpr size_t PolygonFlags = 0x30;                   // i16
 constexpr uint16_t TileWater = 2;
+constexpr uintptr_t RenderRect = 0xF8BAA4;             // RECT: game 3D view in game screen coords (GrayFace _RenderRect)
 constexpr uint16_t TileShore = 0x100;                   // shore: water + sand/grass in one texture
 // The game always renders in a 640x480 logical screen; dxwrapper stretches it to the D3D9 back buffer.
 // ponytail: assumes a plain stretch (no letterbox); read dxwrapper's scaling if a mode ever letterboxes.
@@ -371,6 +372,7 @@ float4 mul : register(c5);    // dxwrapper fix-up multiplier
 float4 gf : register(c6);     // GrayFace HD scaling: xy * gf.xy + gf.zw
 float4 mir : register(c7);    // x = planar mirror in mirrorTex (sceneTex = sky only), y = debug: reflection only
 float4 shore : register(c8);  // x = 1: single-layer shore tile, effect masked to water-coloured texels
+float4 view : register(c9);   // game 3D view rect (game screen coords): left, top, right, bottom
 sampler2D mirrorTex : register(s2);
 // "looks like water": blue clearly above red (sand/grass/dirt have b < r) and not grey (rock, foam)
 static const float2 BlueMinusRed = float2(0.04, 0.12); // smoothstep edges of b - r
@@ -404,13 +406,15 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : 
 	float yr = params.y + params.z * tr;               // reflected point, game px
 	float below = max(y - extra.y, 0.0) * extra.z;
 	float2 ruv = to_rt_uv(float2(gp.x, yr)) + rip * (1.0 + below * 6.0);
-	float top = vp.y * rt.y;
+	// valid image = the game's 3D view; the render target around it is not drawn (black)
+	float2 vlo = to_rt_uv(view.xy), vhi = to_rt_uv(view.zw);
+	float2 lo = min(vlo, vhi), hi = max(vlo, vhi) - rt.xy;
+	float top = lo.y;
 	float inside = saturate((ruv.y - top) * 8.0);      // reflected ray left the top of the view: no data
-	ruv = float2(clamp(ruv.x, vp.x * rt.x, (vp.x + vp.z) * rt.x), clamp(ruv.y, top, (vp.y + vp.w) * rt.y));
+	ruv = clamp(ruv, lo, hi);
 	float3 refl = tex2D(sceneTex, ruv).rgb;
 	// planar mirror: mirrored geometry rendered for this very pixel (alpha = coverage), the sky behind it is
 	// exact under the angular mirror, so clamping at the top only stretches the zenith sky
-	float2 lo = vp.xy * rt.xy, hi = (vp.xy + vp.zw) * rt.xy;
 	float4 mr = tex2D(mirrorTex, clamp((vpos + 0.5) * rt.xy + rip * (1.0 + below * 6.0), lo, hi));
 	refl = lerp(refl, mr.rgb, mr.a * mir.x);
 	inside = lerp(inside, 1.0, mir.x);
@@ -916,6 +920,9 @@ static void draw_water_batch()
 	s_dev->SetPixelShader(s_water_ps);
 	s_dev->SetPixelShaderConstantF(0, params, 2);
 	s_dev->SetPixelShaderConstantF(2, rtc, 4);
+	const int32_t *rr = reinterpret_cast<const int32_t *>(mm7::RenderRect);
+	const float viewc[4] = {float(rr[0]), float(rr[1]), float(rr[2]), float(rr[3])};
+	s_dev->SetPixelShaderConstantF(9, viewc, 1);
 	s_dev->SetVertexShaderConstantF(0, s_dxw_off, 1);
 	s_dev->SetVertexShaderConstantF(1, s_dxw_mul, 1);
 	const float gfc[4] = {s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1]};
