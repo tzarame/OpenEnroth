@@ -1286,8 +1286,8 @@ namespace fogcfg { // MM7 units: a terrain tile is 512
 constexpr float Density = 2.6e-4f;     // extinction per unit at water level, fully inside the fog
 constexpr float HeightFalloff = 450;   // H of the dense ground layer (the thin haze above uses 2500, in the shader)
 constexpr float MaxDist = 20000;       // march length cap (sky rays use all of it)
-constexpr float FogStart = 250;       // no fog closer than this ...
-constexpr float FogRamp = 1800;        // ... full density from FogStart + FogRamp on
+constexpr float FogStart = 1200;       // no fog closer than this ...
+constexpr float FogRamp = 3500;        // ... full density from FogStart + FogRamp on
 constexpr float NoiseScale = 1.0f / (128 * 900);  // noise texture (128 texels) uv per world unit: ~900-unit banks
 constexpr float WindX = 90, WindY = 40; // units/s; the fine octave drifts 1.6x faster
 constexpr float SunGlow = 0.45f;       // forward-scattering glow strength toward the sun
@@ -1545,7 +1545,7 @@ float4 sky_near_horizon(float x)
 	return float4(tex2Dlod(skyTex, float4(to_rt_uv(float2(x, clamp(y, view.y, view.w))), 0.0, 0.0)).rgb * ok, ok);
 }
 
-static const int Steps = 20;
+static const int Steps = 12;
 float4 ps_fog(float2 vpos : VPOS) : COLOR
 {
 	float2 px = vpos + 0.5;
