@@ -792,7 +792,7 @@ static void bb_on_draw()
 		s_bb_verts.resize(p.first);
 }
 
-constexpr float MirrorMaxDist = 7000; // forward depth beyond which geometry is not mirrored
+constexpr float MirrorMaxDist = 1e9f; // mirror everything the game drew (a shorter cut-off showed as a reflection edge before the fog)
 static bool mirror_wanted()
 {
 	return s_mode == Mode::Effect || s_mode == Mode::DebugSolid || s_mode == Mode::DebugReflection;
