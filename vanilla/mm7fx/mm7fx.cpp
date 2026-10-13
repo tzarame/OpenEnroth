@@ -368,10 +368,10 @@ sampler2D layerTex : register(s1);
 float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
 {
 	float4 t = tex2D(layerTex, uv);
-	// transparent texels are black: bilinear filtering darkens the edge colour (dark outline along the shore);
-	// undo it by dividing by the filtered alpha
-	float3 c = t.rgb / max(t.a, 1e-3);
-	return float4(saturate(c) * color.rgb, t.a); // vertex alpha is not meaningful for terrain
+	// transparent texels are black, so the bilinear-filtered colour is already premultiplied by alpha:
+	// blended with ONE / INVSRCALPHA this gives clean edges (straight alpha gave a dark outline, dividing by
+	// alpha a bright one)
+	return float4(t.rgb * color.rgb, t.a); // vertex alpha is not meaningful for terrain
 }
 )";
 
@@ -437,14 +437,25 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 world : TEXCOOR
 	// --- reflection (planar mirror, angular sky fallback), distorted by the wave normals ---
 	float2 rip = nxy * 0.03 * saturate(1800.0 / dist);
 	float t = (y - params.y) / params.z;               // tan of the view-space vertical angle
-	float tr = (params.w - t) / (1.0 + params.w * t);  // mirrored about the horizon angle
+	float den = 1.0 + params.w * t;
+	float tr = (params.w - t) / den;                   // mirrored about the horizon angle
 	float yr = params.y + params.z * tr;               // reflected point, game px
+	// steep views: the reflected ray points (almost) at the zenith, the formula degenerates (den -> 0) and
+	// stretched clouds showed as bright rays; such rays and any not above the horizon use the zenith fallback
+	float valid = saturate(den * 10.0) * saturate((extra.y - yr) * 0.05);
 	float2 ruv = to_rt_uv(float2(gp.x, yr)) + rip;
 	// valid image = the game's 3D view; the render target around it is not drawn (black)
 	float2 vlo = to_rt_uv(view.xy), vhi = to_rt_uv(view.zw);
 	float2 lo = min(vlo, vhi), hi = max(vlo, vhi) - rt.xy;
-	float inside = saturate((ruv.y - lo.y) * 8.0);     // reflected ray left the top of the view: no data
+	float inside = saturate((ruv.y - lo.y) * 8.0) * valid; // reflected ray left the top of the view: no data
 	float3 refl = tex2D(sceneTex, clamp(ruv, lo, hi)).rgb;
+	// beyond the top of the view: a horizontally blurred sky colour from the top rows instead of a stretched
+	// row (which showed as vertical streaks through the clouds)
+	float ty = lo.y + 0.02;
+	float3 skyTop = (tex2D(sceneTex, float2(clamp(ruv.x - 0.12, lo.x, hi.x), ty)).rgb + tex2D(sceneTex, float2(clamp(ruv.x - 0.06, lo.x, hi.x), ty)).rgb
+	               + tex2D(sceneTex, float2(clamp(ruv.x, lo.x, hi.x), ty)).rgb + tex2D(sceneTex, float2(clamp(ruv.x + 0.06, lo.x, hi.x), ty)).rgb
+	               + tex2D(sceneTex, float2(clamp(ruv.x + 0.12, lo.x, hi.x), ty)).rgb) * 0.2;
+	refl = lerp(skyTop, refl, inside);
 	float4 mr = tex2D(mirrorTex, clamp((vpos + 0.5) * rt.xy + rip, lo, hi));
 	refl = lerp(refl, mr.rgb, mr.a * mir.x);
 	inside = lerp(inside, 1.0, mir.x);
@@ -977,8 +988,8 @@ static bool mirror_render()
 	D3DSURFACE_DESC md = {};
 	if (s_mirror_tex)
 		s_mirror_tex->GetLevelDesc(0, &md);
-	// half resolution: the reflection is blurred by ripples anyway, a quarter of the fill rate
-	const UINT mw = (rd.Width + 1) / 2, mh = (rd.Height + 1) / 2;
+	// full resolution: at half resolution the reflection looked visibly blurrier
+	const UINT mw = rd.Width, mh = rd.Height;
 	if (!s_mirror_tex || md.Width != mw || md.Height != mh) {
 		if (s_mirror_tex) s_mirror_tex->Release();
 		if (s_mirror_depth) s_mirror_depth->Release();
@@ -1007,9 +1018,7 @@ static bool mirror_render()
 	s_dev->GetDepthStencilSurface(&prev_ds);
 	s_dev->SetRenderTarget(0, mrt);
 	s_dev->SetDepthStencilSurface(s_mirror_depth);
-	D3DVIEWPORT9 hvp = s_game_vp; // same mapping at half scale
-	hvp.X /= 2; hvp.Y /= 2; hvp.Width = (hvp.Width + 1) / 2; hvp.Height = (hvp.Height + 1) / 2;
-	s_dev->SetViewport(&hvp);
+	s_dev->SetViewport(&s_game_vp);
 	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
 	const float zn = 16.0f, zf = 65536.0f;
 	const float vc[24] = {nrm[0], nrm[1], nrm[2], d, ax, bx, ay, by,
@@ -1191,8 +1200,8 @@ static void draw_water_batch()
 	if (s_mode == Mode::Effect) {
 		s_dev->SetPixelShader(s_overlay_ps);
 		s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-		s_dev->SetRenderState(D3DRS_SRCBLEND, s_overlay_src);
-		s_dev->SetRenderState(D3DRS_DESTBLEND, s_overlay_dst);
+		s_dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE); // premultiplied (see s_overlay_ps_src)
+		s_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 		s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 		s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
 		for (const auto &p : s_water_polys) {
