@@ -104,7 +104,10 @@ static IDirect3DDevice9 *s_dev = nullptr;
 static uint8_t *s_current_poly = nullptr; // set only while the game is inside DrawTerrainPolygon
 static uint32_t s_current_n = 0;          // vertex count after clipping (DrawTerrainPolygon arg, not Polygon::uNumVertices)
 static bool s_poly_captured = false;
-static IDirect3DBaseTexture9 *s_poly_tex = nullptr; // base-pass texture of the current tile (AddRef'd)
+static IDirect3DBaseTexture9 *s_poly_tex = nullptr;
+static IDirect3DBaseTexture9 *s_poly_overlay = nullptr; // alpha-blended layer of a shore tile (AddRef'd)
+static uint32_t s_poly_draws = 0;
+static DWORD s_overlay_src = D3DBLEND_SRCALPHA, s_overlay_dst = D3DBLEND_INVSRCALPHA; // base-pass texture of the current tile (AddRef'd)
 
 // Raw game TL vertex (640x480 screen, z, rhw). Our vertex shader converts it to clip space like dxwrapper's
 // XYZRHW fix-up shader does, so the GPU clips polygons with vertices behind/near the camera correctly.
@@ -114,7 +117,9 @@ static const D3DVERTEXELEMENT9 s_water_decl_elems[] = {
 	{0, 16, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
 	{0, 20, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
 	D3DDECL_END()};
-struct WaterPoly { IDirect3DBaseTexture9 *tex; uint32_t first, count; bool shore; };
+// Shore tiles are drawn by vanilla in two layers: water first, then the shore texture alpha-blended on top.
+// tex = water layer, overlay = shore layer (null for pure water).
+struct WaterPoly { IDirect3DBaseTexture9 *tex; uint32_t first, count; bool shore; IDirect3DBaseTexture9 *overlay; };
 static std::vector<WaterVertex> s_water_verts;
 static std::vector<WaterPoly> s_water_polys;
 
@@ -218,12 +223,18 @@ static void capture_water_poly()
 	const auto *sv = reinterpret_cast<const mm7::SoftVertex *>(mm7::SoftVertices);
 
 
-	s_dev->GetRenderState(D3DRS_ZENABLE, &s_game_zenable);
-	s_dev->GetRenderState(D3DRS_ZFUNC, &s_game_zfunc);
-	s_dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_game_zwrite);
+	if (s_poly_tex) { // depth setup of the water layer, not of an alpha-blended shore layer
+		s_dev->GetRenderState(D3DRS_ZENABLE, &s_game_zenable);
+		s_dev->GetRenderState(D3DRS_ZFUNC, &s_game_zfunc);
+		s_dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_game_zwrite);
+	}
 	const bool shore = !(*reinterpret_cast<const int16_t *>(s_current_poly + mm7::PolygonFlags) & mm7::TileWater);
-	WaterPoly wp = {s_poly_tex, static_cast<uint32_t>(s_water_verts.size()), n, shore}; // reference moves to the poly
-	s_poly_tex = nullptr;
+	// second call of a shore tile (alpha-blended shore layer): kept as an overlay-only poly, drawn after all water;
+	// the shore tile's water layer (first call) is then plain water
+	const bool layer = s_poly_overlay && !s_poly_tex;
+	WaterPoly wp = {s_poly_tex, static_cast<uint32_t>(s_water_verts.size()), n, shore && !layer && false, s_poly_overlay};
+	s_poly_tex = nullptr; // references move to the poly
+	s_poly_overlay = nullptr;
 	// consistency check: TL x/y must equal the soft vertices' projected x/y
 	static uint32_t mism = 0, total = 0;
 	for (uint32_t i = 0; i < n; ++i) {
@@ -327,6 +338,16 @@ VSOut main(VSIn i)
 }
 )";
 
+// shore layer drawn over our water: plain texture * vertex colour, alpha from the texture (like vanilla)
+static const char s_overlay_ps_src[] = R"(
+sampler2D layerTex : register(s1);
+float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
+{
+	float4 t = tex2D(layerTex, uv);
+	return float4(t.rgb * color.rgb, t.a); // vertex alpha is not meaningful for terrain
+}
+)";
+
 static const char s_water_ps_src[] = R"(
 sampler2D sceneTex : register(s0);
 sampler2D waterTex : register(s1);
@@ -385,6 +406,7 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : 
 )";
 
 static IDirect3DPixelShader9 *s_water_ps = nullptr;
+static IDirect3DPixelShader9 *s_overlay_ps = nullptr;
 static IDirect3DVertexShader9 *s_water_vs = nullptr;
 static IDirect3DVertexDeclaration9 *s_water_decl = nullptr;
 static IDirect3DTexture9 *s_scene_tex = nullptr;
@@ -412,17 +434,21 @@ static bool init_water_resources()
 		if (err) err->Release();
 		return SUCCEEDED(hr);
 	};
-	ID3DBlob *vs = nullptr, *ps = nullptr;
-	if (!build(s_water_vs_src, sizeof(s_water_vs_src) - 1, "vs_3_0", &vs) || !build(s_water_ps_src, sizeof(s_water_ps_src) - 1, "ps_3_0", &ps)) {
+	ID3DBlob *vs = nullptr, *ps = nullptr, *ops = nullptr;
+	if (!build(s_water_vs_src, sizeof(s_water_vs_src) - 1, "vs_3_0", &vs) || !build(s_water_ps_src, sizeof(s_water_ps_src) - 1, "ps_3_0", &ps)
+		|| !build(s_overlay_ps_src, sizeof(s_overlay_ps_src) - 1, "ps_3_0", &ops)) {
 		if (vs) vs->Release();
+		if (ps) ps->Release();
 		return false;
 	}
 	HRESULT hr = s_dev->CreateVertexShader(static_cast<const DWORD *>(vs->GetBufferPointer()), &s_water_vs);
 	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(static_cast<const DWORD *>(ps->GetBufferPointer()), &s_water_ps);
+	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(static_cast<const DWORD *>(ops->GetBufferPointer()), &s_overlay_ps);
 	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexDeclaration(s_water_decl_elems, &s_water_decl);
 	if (SUCCEEDED(hr)) hr = s_dev->CreateStateBlock(D3DSBT_ALL, &s_state);
 	vs->Release();
 	ps->Release();
+	ops->Release();
 	if (FAILED(hr)) {
 		log_info("mm7fx: creating water shaders/decl/state block failed 0x%08lx", hr);
 		return false;
@@ -434,8 +460,10 @@ static bool init_water_resources()
 
 static void release_captured()
 {
-	for (auto &p : s_water_polys)
+	for (auto &p : s_water_polys) {
 		if (p.tex) p.tex->Release();
+		if (p.overlay) p.overlay->Release();
+	}
 	s_water_polys.clear();
 	s_water_verts.clear();
 	if (s_game_rt) {
@@ -538,6 +566,8 @@ static void draw_water_batch()
 	IDirect3DBaseTexture9 *bound = nullptr;
 	int shore = -1;
 	for (const auto &p : s_water_polys) {
+		if (!p.tex)
+			continue; // overlay-only (shore layer)
 		if (p.tex != bound) {
 			s_dev->SetTexture(1, p.tex);
 			bound = p.tex;
@@ -548,6 +578,21 @@ static void draw_water_batch()
 			s_dev->SetPixelShaderConstantF(7, sc, 1);
 		}
 		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
+	}
+	// shore layers on top of the water, blended like vanilla did
+	if (s_mode == Mode::Effect) {
+		s_dev->SetPixelShader(s_overlay_ps);
+		s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+		s_dev->SetRenderState(D3DRS_SRCBLEND, s_overlay_src);
+		s_dev->SetRenderState(D3DRS_DESTBLEND, s_overlay_dst);
+		s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+		s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+		for (const auto &p : s_water_polys) {
+			if (!p.overlay)
+				continue;
+			s_dev->SetTexture(1, p.overlay);
+			s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
+		}
 	}
 	if (s_mode == Mode::DebugSolid) {
 		// calibration quad in game screen coordinates: must cover x 100..540, y 200..400
@@ -574,6 +619,9 @@ static void draw_water_batch()
 			ymin = v.y < ymin ? v.y : ymin; ymax = v.y > ymax ? v.y : ymax;
 			xmin = v.x < xmin ? v.x : xmin; xmax = v.x > xmax ? v.x : xmax;
 		}
+		size_t layers = 0;
+		for (const auto &p : s_water_polys) layers += p.overlay != nullptr;
+		log_info("mm7fx dbg: shore layers in batch: %zu, overlay ps %p", layers, (void *)s_overlay_ps);
 		log_info("mm7fx dbg: GrayFace map x*%.4f%+.1f y*%.4f%+.1f", s_gf_mul[0], s_gf_add[0], s_gf_mul[1], s_gf_add[1]);
 		log_info("mm7fx dbg: batch %zu polys %zu verts, x [%.0f..%.0f] y [%.0f..%.0f], viewport %lu,%lu %lux%lu, RT %ux%u, dxw off (%.2f %.2f %.2f) mul (%.6f %.6f %.3f)",
 			s_water_polys.size(), s_water_verts.size(), xmin, xmax, ymin, ymax, vp.X, vp.Y, vp.Width, vp.Height, rd.Width, rd.Height,
@@ -599,6 +647,11 @@ static void __fastcall hook_draw_terrain_polygon(void *self, void *edx, uint32_t
 		s_poly_tex->Release();
 		s_poly_tex = nullptr;
 	}
+	if (s_poly_overlay) {
+		s_poly_overlay->Release();
+		s_poly_overlay = nullptr;
+	}
+	s_poly_draws = 0;
 	s_current_poly = nullptr;
 }
 
@@ -659,7 +712,7 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 				vertex_count, first_vertex, s_poly_captured, s_current_n, (int)(int8_t)s_current_poly[0x5D], (int)(int8_t)s_current_poly[0x5C],
 				tl[0].x, tl[0].y, tl[0].z, tl[1].x, tl[1].y, tl[2].x, tl[2].y);
 		}
-		if (!s_poly_captured) {
+		if (s_poly_draws++ == 0) {
 			// inside the draw: dxwrapper's per-draw viewport, target and fix-up constants are live right now
 			s_dev->GetViewport(&s_game_vp);
 			if (!s_game_rt)
@@ -667,7 +720,30 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 			s_dev->GetVertexShaderConstantF(0, s_dxw_off, 1);
 			s_dev->GetVertexShaderConstantF(1, s_dxw_mul, 1);
 			update_grayface_scale(s_current_n);
-			s_dev->GetTexture(0, &s_poly_tex); // base pass texture (later passes bind lightmaps/fog)
+			// Shore tiles come as two DrawTerrainPolygon calls: the water layer, then the shore texture alpha-blended.
+			DWORD blend = FALSE;
+			s_dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+			if (blend && (*reinterpret_cast<const int16_t *>(s_current_poly + mm7::PolygonFlags) & mm7::TileShore)) {
+				s_dev->GetTexture(0, &s_poly_overlay);
+				s_dev->GetRenderState(D3DRS_SRCBLEND, &s_overlay_src);
+				s_dev->GetRenderState(D3DRS_DESTBLEND, &s_overlay_dst);
+			} else {
+				s_dev->GetTexture(0, &s_poly_tex); // base pass texture (water layer)
+			}
+		}
+		static int shore_dbg = 3;
+		if (shore_dbg > 0 && (*reinterpret_cast<const int16_t *>(s_current_poly + mm7::PolygonFlags) & mm7::TileShore)) {
+			IDirect3DBaseTexture9 *t = nullptr;
+			DWORD blend = 0, src = 0, dst = 0, top = 0;
+			s_dev->GetTexture(0, &t);
+			s_dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+			s_dev->GetRenderState(D3DRS_SRCBLEND, &src);
+			s_dev->GetRenderState(D3DRS_DESTBLEND, &dst);
+			s_dev->GetTextureStageState(0, D3DTSS_COLOROP, &top);
+			log_info("mm7fx dbg: shore poly draw #%u tex=%p blend=%lu src=%lu dst=%lu colorop=%lu flags=%04x",
+				s_poly_draws, (void *)t, blend, src, dst, top, *reinterpret_cast<const uint16_t *>(s_current_poly + mm7::PolygonFlags));
+			if (t) t->Release();
+			if (s_poly_draws >= 3) --shore_dbg;
 		}
 		if (!s_scene_ready || s_init_failed)
 			return false; // effect not available yet (first frame): vanilla water
@@ -733,6 +809,8 @@ static void on_destroy_device(device *)
 	release_captured();
 	if (s_state) s_state->Release();
 	if (s_water_ps) s_water_ps->Release();
+	if (s_overlay_ps) s_overlay_ps->Release();
+	s_overlay_ps = nullptr;
 	if (s_water_vs) s_water_vs->Release();
 	if (s_water_decl) s_water_decl->Release();
 	s_water_vs = nullptr;
