@@ -24,7 +24,9 @@ Sources: Ghidra decompile of the target exe, cross-checked against OpenEnroth's 
 | 0x5C | i8 terrain_grid_z (row)            |
 | 0x5D | i8 terrain_grid_x (col)            |
 
-Water tile ⇔ `flags & 2`. Vanilla then swaps the texture for the animated HD water frame when
+Water tile ⇔ `flags & 2`. Shore tile ⇔ `flags & 0x100` (TILE_SHORE; 0x200 = TILE_TRANSITION): one texture with
+water baked in next to sand/grass. mm7fx redraws shore tiles in the water batch and applies reflection/ripples only
+to bluish texels (`water_mask` in the pixel shader: smoothstep on b − r and saturation); DebugSolid shows them cyan. Vanilla then swaps the texture for the animated HD water frame when
 `uTileBitmapID == hd_water_tile_id` (`pHDWaterBitmapIDs[hd_water_current_frame]`; GrayFace exposes
 frame count/delay as `HDWTRCount`/`HDWTRDelay` in mm7.ini).
 

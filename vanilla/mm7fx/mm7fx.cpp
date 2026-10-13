@@ -6,6 +6,8 @@
 //   - water tiles (Polygon::flags & 2): at the vanilla draw we draw the tile ourselves with our pixel shader
 //     (screen-space reflection from the previous frame's 3D scene + ripples) and skip the vanilla
 //     passes, keeping the game's draw order and occlusion;
+//   - shore tiles (flags & 0x100, water baked into a sand/grass texture) go through the same batch, but the shader
+//     masks the effect per texel by colour (bluish = water), so sand/grass stay the plain base texture;
 //   - detour Render::DrawBillboards_And_MaybeRenderSpecialEffects_And_EndScene: copy the finished 3D scene
 //     (before billboards/UI) as the reflection source for the next frame;
 //   - horizon line is derived from the captured vertices (world/view/screen), no FOV guessing.
@@ -54,6 +56,7 @@ constexpr uintptr_t SoftVertices = 0x50AA90;            // RenderVertexSoft[], s
 constexpr uintptr_t TLVertices = 0x77E448;              // D3DTLVERTEX[], stride 0x20, filled by DrawTerrainPolygon
 constexpr size_t PolygonFlags = 0x30;                   // i16
 constexpr uint16_t TileWater = 2;
+constexpr uint16_t TileShore = 0x100;                   // shore: water + sand/grass in one texture
 // The game always renders in a 640x480 logical screen; dxwrapper stretches it to the D3D9 back buffer.
 // ponytail: assumes a plain stretch (no letterbox); read dxwrapper's scaling if a mode ever letterboxes.
 constexpr float ScreenW = 640.0f, ScreenH = 480.0f;
@@ -111,7 +114,7 @@ static const D3DVERTEXELEMENT9 s_water_decl_elems[] = {
 	{0, 16, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
 	{0, 20, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
 	D3DDECL_END()};
-struct WaterPoly { IDirect3DBaseTexture9 *tex; uint32_t first, count; };
+struct WaterPoly { IDirect3DBaseTexture9 *tex; uint32_t first, count; bool shore; };
 static std::vector<WaterVertex> s_water_verts;
 static std::vector<WaterPoly> s_water_polys;
 
@@ -218,7 +221,8 @@ static void capture_water_poly()
 	s_dev->GetRenderState(D3DRS_ZENABLE, &s_game_zenable);
 	s_dev->GetRenderState(D3DRS_ZFUNC, &s_game_zfunc);
 	s_dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_game_zwrite);
-	WaterPoly wp = {s_poly_tex, static_cast<uint32_t>(s_water_verts.size()), n}; // reference moves to the poly
+	const bool shore = !(*reinterpret_cast<const int16_t *>(s_current_poly + mm7::PolygonFlags) & mm7::TileWater);
+	WaterPoly wp = {s_poly_tex, static_cast<uint32_t>(s_water_verts.size()), n, shore}; // reference moves to the poly
 	s_poly_tex = nullptr;
 	// consistency check: TL x/y must equal the soft vertices' projected x/y
 	static uint32_t mism = 0, total = 0;
@@ -265,6 +269,8 @@ static void capture_water_poly()
 		for (uint32_t i = 0; i < n && !(gx && gy); ++i)
 			for (uint32_t j = 0; j < n; ++j) {
 				const float dwx = sv[j].wx - sv[i].wx, dwy = sv[j].wy - sv[i].wy;
+				if (std::fabs(sv[j].wz - sv[i].wz) > 1) // shore tiles are not flat
+					continue;
 				const float dv[3] = {sv[j].vx - sv[i].vx, sv[j].vy - sv[i].vy, sv[j].vz - sv[i].vz};
 				if (!gx && std::fabs(dwx) > 100 && std::fabs(dwy) < 1) { for (int k = 0; k < 3; ++k) rx[k] = dv[k] / dwx; gx = true; }
 				if (!gy && std::fabs(dwy) > 100 && std::fabs(dwx) < 1) { for (int k = 0; k < 3; ++k) ry[k] = dv[k] / dwy; gy = true; }
@@ -331,6 +337,16 @@ float4 vp : register(c3);     // viewport X, Y, W, H
 float4 off : register(c4);    // dxwrapper fix-up offset
 float4 mul : register(c5);    // dxwrapper fix-up multiplier
 float4 gf : register(c6);     // GrayFace HD scaling: xy * gf.xy + gf.zw
+float4 shore : register(c7);  // x = 1: shore tile, effect masked to water-coloured texels
+// "looks like water": blue clearly above red (sand/grass/dirt have b < r) and not grey (rock, foam)
+static const float2 BlueMinusRed = float2(0.04, 0.12); // smoothstep edges of b - r
+static const float2 Saturation = float2(0.10, 0.22);   // smoothstep edges of (max - min) / max
+float water_mask(float3 t)
+{
+	float mx = max(t.r, max(t.g, t.b));
+	float sat = (mx - min(t.r, min(t.g, t.b))) / max(mx, 1e-3);
+	return smoothstep(BlueMinusRed.x, BlueMinusRed.y, t.b - t.r) * smoothstep(Saturation.x, Saturation.y, sat);
+}
 float2 to_game(float2 px)     // RT pixel -> game TL screen coords
 {
 	float2 ndc = float2((px.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (px.y - vp.y) / vp.w * 2.0);
@@ -358,11 +374,13 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : 
 	float inside = saturate((ruv.y - top) * 40.0);     // reflected ray left the top of the view: no data
 	ruv = float2(clamp(ruv.x, vp.x * rt.x, (vp.x + vp.z) * rt.x), clamp(ruv.y, top, (vp.y + vp.w) * rt.y));
 	float3 refl = tex2D(sceneTex, ruv).rgb;
-	float3 base = tex2D(waterTex, uv + rip * 4.0).rgb * color.rgb;
+	float m = shore.x > 0.5 ? water_mask(tex2D(waterTex, uv).rgb) : 1.0;
+	float3 base = tex2D(waterTex, uv + rip * 4.0 * m).rgb * color.rgb; // m = 0: exactly the base texture
 	float fresnel = saturate(1.0 - below * 3.5);
-	float k = extra.x * (0.35 + 0.55 * fresnel) * inside;
+	float k = extra.x * (0.35 + 0.55 * fresnel) * inside * m;
 	float3 c = lerp(base, refl * float3(0.85, 0.92, 1.0), k);
-	return float4(lerp(c, float3(1.0, 0.0, 1.0), extra.w), 1.0); // extra.w = 1: debug solid magenta
+	float3 dbg = shore.x > 0.5 ? float3(0.0, 1.0, 1.0) : float3(1.0, 0.0, 1.0);
+	return float4(lerp(c, dbg, extra.w), 1.0); // extra.w = 1: debug solid magenta (water) / cyan (shore)
 }
 )";
 
@@ -518,10 +536,16 @@ static void draw_water_batch()
 	s_dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 	s_dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 	IDirect3DBaseTexture9 *bound = nullptr;
+	int shore = -1;
 	for (const auto &p : s_water_polys) {
 		if (p.tex != bound) {
 			s_dev->SetTexture(1, p.tex);
 			bound = p.tex;
+		}
+		if (p.shore != shore) {
+			shore = p.shore;
+			const float sc[4] = {float(shore), 0, 0, 0};
+			s_dev->SetPixelShaderConstantF(7, sc, 1);
 		}
 		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
 	}
@@ -529,6 +553,8 @@ static void draw_water_batch()
 		// calibration quad in game screen coordinates: must cover x 100..540, y 200..400
 		// calibration quad: 20%..80% of the game's view in x, 40%..80% in y (via dxwrapper's mapping)
 		const float gw = 460.0f, gh = 343.0f, gx0 = 8.0f, gy0 = 8.0f; // game 3D view rect (8,8)-(468,351)
+		const float sc[4] = {};
+		s_dev->SetPixelShaderConstantF(7, sc, 1);
 		const WaterVertex q[4] = {{gx0 + gw * 0.2f, gy0 + gh * 0.4f, 0.5f, 1, 0xFFFFFFFF, 0, 0}, {gx0 + gw * 0.8f, gy0 + gh * 0.4f, 0.5f, 1, 0xFFFFFFFF, 1, 0},
 		                          {gx0 + gw * 0.8f, gy0 + gh * 0.8f, 0.5f, 1, 0xFFFFFFFF, 1, 1}, {gx0 + gw * 0.2f, gy0 + gh * 0.8f, 0.5f, 1, 0xFFFFFFFF, 0, 1}};
 		s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
@@ -605,7 +631,7 @@ static void __fastcall hook_end_scene(void *self, void *edx)
 
 static bool is_water(const uint8_t *poly)
 {
-	return *reinterpret_cast<const int16_t *>(poly + mm7::PolygonFlags) & mm7::TileWater;
+	return *reinterpret_cast<const int16_t *>(poly + mm7::PolygonFlags) & (mm7::TileWater | mm7::TileShore);
 }
 
 static uint32_t s_dbg_left = 0; // diagnostic lines left for the current 5 s window
