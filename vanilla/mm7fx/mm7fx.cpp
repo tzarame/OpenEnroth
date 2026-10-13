@@ -656,8 +656,12 @@ static void mirror_end(const uint8_t *poly)
 			s_mir_fit_x.add(sv[i].vy / sv[i].vx, sv[i].px);
 			s_mir_fit_y.add(sv[i].vz / sv[i].vx, sv[i].py);
 		}
-	const bool water = poly && (*reinterpret_cast<const int16_t *>(poly + mm7::PolygonFlags) & mm7::TileWater);
-	if (water) {
+	const int16_t flags = poly ? *reinterpret_cast<const int16_t *>(poly + mm7::PolygonFlags) : 0;
+	const bool water = flags & mm7::TileWater;
+	// shore tiles (water layer + shore layer at water level) must not be mirrored either: their flat water layer
+	// would cover the mirrored landscape near the coast
+	if (!water && (flags & mm7::TileShore)) {
+	} else if (water) {
 		for (uint32_t i = 0; i < n; ++i) {
 			s_mir_water_sum[0] += sv[i].vx; s_mir_water_sum[1] += sv[i].vy; s_mir_water_sum[2] += sv[i].vz;
 		}
