@@ -693,6 +693,8 @@ static void mirror_begin(uint32_t n)
 	s_mir_cur_tex = nullptr;
 }
 
+static void fog_capture_poly(uint32_t n, bool terrain, bool water); // volumetric fog section
+
 static void mirror_end(const uint8_t *poly)
 {
 	const uint32_t n = s_mir_n;
@@ -707,6 +709,7 @@ static void mirror_end(const uint8_t *poly)
 		}
 	const int16_t flags = poly ? *reinterpret_cast<const int16_t *>(poly + mm7::PolygonFlags) : 0;
 	const bool water = flags & mm7::TileWater;
+	fog_capture_poly(n, s_current_poly != nullptr, water && s_current_poly);
 	// shore tiles (water layer + shore layer at water level) must not be mirrored either: their flat water layer
 	// would cover the mirrored landscape near the coast
 	if (!water && (flags & mm7::TileShore)) {
@@ -1076,6 +1079,555 @@ static void draw_water_batch()
 	}
 }
 
+// ---- volumetric height fog -------------------------------------------------------------------
+// After the billboards (before the UI) the finished 3D view gets height fog that also hides the draw-distance edge.
+//  1. depth: all captured geometry of this frame (terrain, water, shore, buildings from mirror_end; billboards from
+//     bb_on_draw, alpha-tested) is re-rendered in view space into an R32F target holding forward depth (0 = sky);
+//  2. fog: a quad over the game's RenderRect reconstructs every pixel's view ray from the fitted projection, turns it
+//     into world space with the camera basis fitted from the soft vertices (world vs view positions of the same
+//     vertices) and ray-marches density = Density * exp(-height above water / H) * (0.55 + 0.45 * noise);
+//     blended as dst * T + inscatter * (1 - T). Sky pixels get the same march plus horizon haze.
+// Toggle: Effect mode only, and mm7fx_fog.txt (0/1, default 1) in the game folder, polled like mm7fx_mode.txt.
+
+namespace fogcfg { // MM7 units: a terrain tile is 512
+constexpr float Density = 1.7e-4f;     // extinction per unit at water level, fully inside the fog
+constexpr float HeightFalloff = 1800;  // H: density * exp(-height above water / H)
+constexpr float MaxDist = 20000;       // march length cap (sky rays use all of it)
+constexpr float FogStart = 1000;       // no fog closer than this ...
+constexpr float FogRamp = 5000;        // ... full density from FogStart + FogRamp on
+constexpr float NoiseScale = 1.0f / (128 * 1500); // noise texture (128 texels) uv per world unit: ~1500-unit blobs
+constexpr float WindX = 90, WindY = 40; // units/s; the fine octave drifts 1.6x faster
+constexpr float SunGlow = 0.45f;       // forward-scattering glow strength toward the sun
+constexpr float SunG = 0.55f;          // Henyey-Greenstein anisotropy of the glow
+constexpr float SkyHazeElev = 0.12f;   // sky: fully fogged at the horizon, clear from this sin(elevation) up
+constexpr float EdgeStart = 0.7f;      // geometry: forced fully opaque from EdgeStart * far to far (draw-distance edge)
+constexpr float SunNoonElev = 0.96f;   // sun elevation at noon, radians (~55 deg)
+}
+namespace mm7 {
+constexpr uintptr_t GameHour = 0xACD554, GameMinute = 0xACD558; // int32
+}
+
+static bool s_fog_on = true;               // mm7fx_fog.txt
+static std::vector<MirrorVertex> s_fog_tris; // this frame's opaque geometry, view space, triangle list
+static bool s_fog_terrain = false;         // an outdoor terrain frame (indoors: no fog)
+static IDirect3DSurface9 *s_fog_rt = nullptr; // game render target at the first captured draw (AddRef'd)
+static D3DVIEWPORT9 s_fog_vp = {};
+static float s_fog_dxw[8] = {};            // dxwrapper fix-up offset (c0) and multiplier (c1) at that draw
+static bool s_fog_gf_done = false;
+static float s_fog_proj[4] = {};           // ax, bx, ay, by of this frame
+static bool s_fog_sky_ok = false;
+static float s_fog_far = 0;                // largest terrain forward depth seen = draw distance
+static float s_fog_base_z = 0;             // world z of the water plane (last seen)
+// camera: least-squares fit view = R * (world - cam) from validated vertices
+struct FogAcc { double sv[3] = {}, sw[3] = {}, svw[3][3] = {}, sww[3][3] = {}, wref[3] = {}; uint32_t cnt = 0; };
+static FogAcc s_fog_acc;
+static float s_fog_rx[3], s_fog_ry[3], s_fog_rz[3], s_fog_cam[3]; // view images of world X/Y/Z, camera world pos
+static bool s_fog_basis_ok = false;
+
+static IDirect3DVertexShader9 *s_fog_depth_vs = nullptr, *s_fog_quad_vs = nullptr;
+static IDirect3DPixelShader9 *s_fog_depth_ps = nullptr, *s_fog_ps = nullptr;
+static IDirect3DVertexDeclaration9 *s_fog_decl = nullptr;
+static IDirect3DStateBlock9 *s_fog_state = nullptr;
+static IDirect3DTexture9 *s_fog_noise = nullptr, *s_fog_depth_tex = nullptr;
+static IDirect3DSurface9 *s_fog_ds = nullptr;
+static bool s_fog_init_failed = false;
+
+static bool fog_wanted()
+{
+	return s_mode == Mode::Effect && s_fog_on;
+}
+
+static void fog_poll_toggle()
+{
+	if (FILE *f = std::fopen("mm7fx_fog.txt", "r")) {
+		int v = 1;
+		if (std::fscanf(f, "%d", &v) == 1 && (v != 0) != s_fog_on) {
+			s_fog_on = v != 0;
+			log_info("mm7fx: fog %s (from mm7fx_fog.txt)", s_fog_on ? "on" : "off");
+		}
+		std::fclose(f);
+	}
+}
+
+// from mirror_end, for every terrain/building polygon (soft vertices are final)
+static void fog_capture_poly(uint32_t n, bool terrain, bool water)
+{
+	if (!fog_wanted())
+		return;
+	const auto *sv = reinterpret_cast<const mm7::SoftVertex *>(mm7::SoftVertices);
+	for (uint32_t k = 2; k < n; ++k)
+		for (uint32_t i : {0u, k - 1, k})
+			s_fog_tris.push_back({sv[i].vx, sv[i].vy, sv[i].vz, 0, 0, 0});
+	if (terrain) {
+		s_fog_terrain = true;
+		for (uint32_t i = 0; i < n; ++i)
+			s_fog_far = std::max(s_fog_far, sv[i].vx); // ponytail: never shrinks; reset if view distance is lowered at runtime
+	}
+	// basis samples only from polygons whose view and world edge lengths agree (clipped vertices keep stale world positions)
+	for (uint32_t i = 1; i < n; ++i) {
+		const float dv[3] = {sv[i].vx - sv[0].vx, sv[i].vy - sv[0].vy, sv[i].vz - sv[0].vz};
+		const float dw[3] = {sv[i].wx - sv[0].wx, sv[i].wy - sv[0].wy, sv[i].wz - sv[0].wz};
+		const float lv = std::sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+		const float lw = std::sqrt(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]);
+		if (std::fabs(lv - lw) > 0.01f * lw + 1.0f)
+			return;
+	}
+	FogAcc &a = s_fog_acc;
+	if (!a.cnt) {
+		a.wref[0] = sv[0].wx; a.wref[1] = sv[0].wy; a.wref[2] = sv[0].wz;
+	}
+	for (uint32_t i = 0; i < n; ++i) {
+		const double v[3] = {sv[i].vx, sv[i].vy, sv[i].vz};
+		const double w[3] = {sv[i].wx - a.wref[0], sv[i].wy - a.wref[1], sv[i].wz - a.wref[2]};
+		for (int r = 0; r < 3; ++r) {
+			a.sv[r] += v[r];
+			a.sw[r] += w[r];
+			for (int c = 0; c < 3; ++c) {
+				a.svw[r][c] += v[r] * w[c];
+				a.sww[r][c] += w[r] * w[c];
+			}
+		}
+	}
+	a.cnt += n;
+	if (water)
+		s_fog_base_z = sv[0].wz;
+}
+
+// R = Cvw * Cww^-1 (covariances), orthonormalised; cam = mean(w) - R^T mean(v)
+static bool fog_solve_basis()
+{
+	const FogAcc &a = s_fog_acc;
+	if (a.cnt < 16)
+		return false;
+	const double inv_n = 1.0 / a.cnt;
+	double cvw[3][3], cww[3][3];
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c) {
+			cvw[r][c] = a.svw[r][c] * inv_n - a.sv[r] * inv_n * a.sw[c] * inv_n;
+			cww[r][c] = a.sww[r][c] * inv_n - a.sw[r] * inv_n * a.sw[c] * inv_n;
+		}
+	const double ridge = 1e-6 * (cww[0][0] + cww[1][1] + cww[2][2]) + 1e-3; // flat views: no world-z spread
+	for (int k = 0; k < 3; ++k)
+		cww[k][k] += ridge;
+	double inv[3][3];
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c) // cofactor (transposed)
+			inv[c][r] = cww[(r + 1) % 3][(c + 1) % 3] * cww[(r + 2) % 3][(c + 2) % 3] - cww[(r + 1) % 3][(c + 2) % 3] * cww[(r + 2) % 3][(c + 1) % 3];
+	const double det = cww[0][0] * inv[0][0] + cww[0][1] * inv[1][0] + cww[0][2] * inv[2][0];
+	if (std::fabs(det) < 1e-12)
+		return false;
+	double col[2][3];
+	for (int k = 0; k < 2; ++k) // images of world X and Y
+		for (int r = 0; r < 3; ++r)
+			col[k][r] = (cvw[r][0] * inv[0][k] + cvw[r][1] * inv[1][k] + cvw[r][2] * inv[2][k]) / det;
+	auto len = [](const double *v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+	const double lx = len(col[0]), ly0 = len(col[1]);
+	if (lx < 0.9 || lx > 1.1 || ly0 < 0.9 || ly0 > 1.1)
+		return false; // not a rigid view transform (bad samples)
+	double x[3], y[3], z[3];
+	for (int r = 0; r < 3; ++r) x[r] = col[0][r] / lx;
+	const double dxy = x[0] * col[1][0] + x[1] * col[1][1] + x[2] * col[1][2];
+	for (int r = 0; r < 3; ++r) y[r] = col[1][r] - dxy * x[r];
+	const double ly = len(y);
+	for (int r = 0; r < 3; ++r) y[r] /= ly;
+	z[0] = x[1] * y[2] - x[2] * y[1]; z[1] = x[2] * y[0] - x[0] * y[2]; z[2] = x[0] * y[1] - x[1] * y[0];
+	const double mv[3] = {a.sv[0] * inv_n, a.sv[1] * inv_n, a.sv[2] * inv_n};
+	const double *axes[3] = {x, y, z};
+	for (int k = 0; k < 3; ++k) {
+		s_fog_rx[k] = float(x[k]); s_fog_ry[k] = float(y[k]); s_fog_rz[k] = float(z[k]);
+		const double *ax = axes[k];
+		s_fog_cam[k] = float(a.wref[k] + a.sw[k] * inv_n - (ax[0] * mv[0] + ax[1] * mv[1] + ax[2] * mv[2]));
+	}
+	return true;
+}
+
+// from on_draw: the game's target, viewport and dxwrapper constants are live during the first captured draw
+static void fog_on_draw()
+{
+	if (!s_mir_n || !fog_wanted())
+		return;
+	if (!s_fog_rt) {
+		s_dev->GetViewport(&s_fog_vp);
+		s_dev->GetRenderTarget(0, &s_fog_rt);
+		s_dev->GetVertexShaderConstantF(0, s_fog_dxw, 2);
+	}
+	if (s_current_poly && !s_fog_gf_done) { // GrayFace's buffer mirrors the terrain TL array during this draw
+		s_fog_gf_done = true;
+		update_grayface_scale(s_current_n);
+	}
+}
+
+static void fog_release_captured()
+{
+	s_fog_tris.clear();
+	s_fog_terrain = false;
+	s_fog_gf_done = false;
+	s_fog_acc = FogAcc();
+	if (s_fog_rt) {
+		s_fog_rt->Release();
+		s_fog_rt = nullptr;
+	}
+}
+
+// before the captures are released (projection fit, sky flag); also gives bb_on_draw this frame's projection
+static bool fog_prepare()
+{
+	if (!fog_wanted() || !s_dev || !s_fog_terrain || !s_fog_rt || s_fog_tris.empty() || !s_fog_vp.Width || !s_fog_vp.Height)
+		return false;
+	float ax, bx, ay, by;
+	if (!s_mir_fit_x.solve(ax, bx) || !s_mir_fit_y.solve(ay, by) || !(bx * by > 0) || bx / by < 0.5f || bx / by > 2.0f)
+		return false;
+	s_fog_proj[0] = ax; s_fog_proj[1] = bx; s_fog_proj[2] = ay; s_fog_proj[3] = by;
+	std::memcpy(s_mir_last_fit, s_fog_proj, sizeof(s_fog_proj));
+	s_mir_last_fit_ok = true;
+	if (fog_solve_basis())
+		s_fog_basis_ok = true; // otherwise keep the previous frame's camera
+	s_fog_sky_ok = s_sky_ready && s_sky_tex;
+	return s_fog_basis_ok;
+}
+
+static const char s_fog_src[] = R"(
+sampler2D tex0 : register(s0);     // depth pass: billboard texture; fog pass: forward depth (0 = sky)
+sampler2D skyTex : register(s1);   // frame after the sky pass
+sampler2D noiseTex : register(s2); // value noise, 4 independent channels
+float4 proj : register(c0);  // game px = proj.x + proj.y * y / x, py = proj.z + proj.w * z / x (view: x fwd, z up)
+float4 gf : register(c1);    // GrayFace HD scaling: xy * gf.xy + gf.zw
+float4 off : register(c2);   // dxwrapper fix-up offset
+float4 mul : register(c3);   // dxwrapper fix-up multiplier
+float4 zr : register(c4);    // x = near, y = far / (far - near)
+float4 rt : register(c5);    // 1/RT width, 1/RT height, sky texture valid, -
+float4 vp : register(c6);    // viewport X, Y, W, H
+float4 rxc : register(c7);   // xyz: view image of world X, w: camera world x
+float4 ryc : register(c8);
+float4 rzc : register(c9);
+float4 sun : register(c10);  // xyz: world sun direction, w: sun visibility
+float4 pal : register(c11);  // rgb: time-of-day fog colour, w: water world z
+float4 sunc : register(c12); // rgb: sun colour, w: draw distance (forward depth)
+float4 dens : register(c13); // density, 1/H, max distance, noise scale
+float4 drift : register(c14);// wind offsets (world units) of the coarse (xy) and fine (zw) octave
+float4 view : register(c15); // game 3D view rect: left, top, right, bottom
+float4 look : register(c16); // HG g, sun glow, sky haze elevation, edge start (fraction of draw distance)
+float4 ramp : register(c17); // fog start, 1 / fog ramp
+float4 atest : register(c18);// x = 1: alpha-test tex0 (billboards)
+
+struct DOut { float4 pos : POSITION; float2 uv : TEXCOORD0; float depth : TEXCOORD1; };
+DOut vs_depth(float3 pos : POSITION, float2 uv : TEXCOORD0)
+{
+	DOut o;
+	float w = pos.x;
+	float2 gw = float2(proj.x * w + proj.y * pos.y, proj.z * w + proj.w * pos.z); // game px * w
+	o.pos = float4((gw * gf.xy + (gf.zw + off.xy) * w) * mul.xy, (w - zr.x) * zr.y, w);
+	o.uv = uv;
+	o.depth = w;
+	return o;
+}
+float4 ps_depth(float2 uv : TEXCOORD0, float depth : TEXCOORD1) : COLOR
+{
+	float a = tex2D(tex0, uv).a;
+	clip(atest.x > 0.5 ? a - 0.5 : 1.0);
+	return float4(depth, 0.0, 0.0, 1.0);
+}
+float4 vs_quad(float3 pos : POSITION) : POSITION // pos.xy in game screen coords
+{
+	return float4((pos.xy * gf.xy + gf.zw + off.xy) * mul.xy, 0.0, 1.0);
+}
+
+float2 to_game(float2 px)
+{
+	float2 ndc = float2((px.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (px.y - vp.y) / vp.w * 2.0);
+	return ((ndc / mul.xy - off.xy) - gf.zw) / gf.xy;
+}
+float2 to_rt_uv(float2 g)
+{
+	float2 ndc = (g * gf.xy + gf.zw + off.xy) * mul.xy;
+	return float2(vp.x + (ndc.x + 1.0) * 0.5 * vp.z, vp.y + (1.0 - ndc.y) * 0.5 * vp.w) * rt.xy;
+}
+// sky colour a little above the horizon in game column x; w = 1 if that point is inside the 3D view
+float4 sky_near_horizon(float x)
+{
+	float ty = (x - proj.x) / proj.y;
+	float tz = -(rzc.x + rzc.y * ty) / (abs(rzc.z) > 0.05 ? rzc.z : 0.05) + 0.06;
+	float y = proj.z + proj.w * tz;
+	float ok = step(view.y + 2.0, y) * step(y, view.w - 2.0) * step(0.05, abs(rzc.z));
+	return float4(tex2Dlod(skyTex, float4(to_rt_uv(float2(x, clamp(y, view.y, view.w))), 0.0, 0.0)).rgb * ok, ok);
+}
+
+static const int Steps = 12;
+float4 ps_fog(float2 vpos : VPOS) : COLOR
+{
+	float2 px = vpos + 0.5;
+	float depth = tex2Dlod(tex0, float4(px * rt.xy, 0.0, 0.0)).r;
+	float2 gp = to_game(px);
+	float3 dv = float3(1.0, (gp.x - proj.x) / proj.y, (gp.y - proj.z) / proj.w); // view ray with forward = 1
+	float dl = length(dv);
+	float3 wd = float3(dot(rxc.xyz, dv), dot(ryc.xyz, dv), dot(rzc.xyz, dv)) / dl;
+	float3 cam = float3(rxc.w, ryc.w, rzc.w);
+	bool sky = depth <= 0.0;
+	float len = sky ? dens.z : min(depth * dl, dens.z);
+	float jit = frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715)))); // interleaved gradient noise
+	float stp = len / Steps;
+	float tau = 0.0;
+	[loop] for (int i = 0; i < Steps; ++i) {
+		float s = (i + jit) * stp;
+		float3 p = cam + wd * s;
+		float hd = exp(-max(p.z - pal.w, 0.0) * dens.y);
+		float2 q = p.xy + p.z * float2(0.6, 0.35); // height shears the 2D noise: blobs change with altitude
+		float n = tex2Dlod(noiseTex, float4((q + drift.xy) * dens.w, 0.0, 0.0)).r * 0.65
+		        + tex2Dlod(noiseTex, float4((q + drift.zw) * dens.w * 3.0, 0.0, 0.0)).g * 0.35;
+		tau += hd * (0.55 + 0.45 * n) * saturate((s - ramp.x) * ramp.y);
+	}
+	float T = exp(-tau * dens.x * stp);
+	if (sky)
+		T *= smoothstep(-0.02, look.z, wd.z);                     // horizon haze: the horizon line dissolves
+	else
+		T *= 1.0 - smoothstep(look.w * sunc.w, sunc.w, depth);    // draw-distance edge disappears in the fog
+	// fog colour: time-of-day palette pulled toward the actual sky near the horizon
+	float3 fc = pal.rgb;
+	if (rt.z > 0.5) {
+		float4 s = sky_near_horizon(lerp(view.x, view.z, 0.2)) + sky_near_horizon(lerp(view.x, view.z, 0.5))
+		         + sky_near_horizon(lerp(view.x, view.z, 0.8));
+		if (s.w > 0.0)
+			fc = lerp(fc, s.rgb / s.w, 0.7 * s.w / 3.0);
+	}
+	float g = look.x;
+	float hg = pow((1.0 - g) * (1.0 - g) / (1.0 + g * g - 2.0 * g * dot(wd, sun.xyz)), 1.5); // HG, 1 toward the sun
+	float3 L = fc + sunc.rgb * (look.y * hg * sun.w);
+	return float4(L * (1.0 - T), T); // blend ONE, SRCALPHA: dst * T + L * (1 - T)
+}
+)";
+
+static bool init_fog_resources()
+{
+	if (s_fog_ps || s_fog_init_failed)
+		return s_fog_ps != nullptr;
+	s_fog_init_failed = true;
+	HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
+	auto compile = dc ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(dc, "D3DCompile")) : nullptr;
+	if (!compile)
+		return false;
+	ID3DBlob *blobs[4] = {};
+	const char *const entries[4][2] = {{"vs_depth", "vs_3_0"}, {"ps_depth", "ps_3_0"}, {"vs_quad", "vs_3_0"}, {"ps_fog", "ps_3_0"}};
+	HRESULT hr = S_OK;
+	for (int i = 0; i < 4 && SUCCEEDED(hr); ++i) {
+		ID3DBlob *err = nullptr;
+		hr = compile(s_fog_src, sizeof(s_fog_src) - 1, "mm7fx_fog", nullptr, nullptr, entries[i][0], entries[i][1], 0, 0, &blobs[i], &err);
+		if (FAILED(hr))
+			log_info("mm7fx: fog %s compile failed 0x%08lx: %s", entries[i][0], hr, err ? static_cast<const char *>(err->GetBufferPointer()) : "?");
+		if (err) err->Release();
+	}
+	auto code = [&](int i) { return static_cast<const DWORD *>(blobs[i]->GetBufferPointer()); };
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexShader(code(0), &s_fog_depth_vs);
+	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(code(1), &s_fog_depth_ps);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexShader(code(2), &s_fog_quad_vs);
+	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(code(3), &s_fog_ps);
+	for (ID3DBlob *b : blobs)
+		if (b) b->Release();
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexDeclaration(s_mirror_decl_elems, &s_fog_decl);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateStateBlock(D3DSBT_ALL, &s_fog_state);
+	// noise: random bytes, bilinear filtering makes it value noise; uploaded via a system-memory copy (works on 9Ex too)
+	IDirect3DTexture9 *sys = nullptr;
+	if (SUCCEEDED(hr)) hr = s_dev->CreateTexture(128, 128, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, nullptr);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateTexture(128, 128, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &s_fog_noise, nullptr);
+	D3DLOCKED_RECT lr;
+	if (SUCCEEDED(hr)) hr = sys->LockRect(0, &lr, nullptr, 0);
+	if (SUCCEEDED(hr)) {
+		uint32_t seed = 0x2545F491;
+		for (int y = 0; y < 128; ++y)
+			for (int x = 0; x < 128; ++x) {
+				seed = seed * 1664525u + 1013904223u;
+				reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(lr.pBits) + y * lr.Pitch)[x] = seed ^ (seed >> 13);
+			}
+		sys->UnlockRect(0);
+		hr = s_dev->UpdateTexture(sys, s_fog_noise);
+	}
+	if (sys) sys->Release();
+	if (FAILED(hr)) {
+		log_info("mm7fx: fog init failed 0x%08lx, fog disabled", hr);
+		return false;
+	}
+	s_fog_init_failed = false;
+	log_info("mm7fx: fog pass ready");
+	return true;
+}
+
+static void fog_release_resources()
+{
+	fog_release_captured();
+	for (IUnknown **p : {reinterpret_cast<IUnknown **>(&s_fog_depth_vs), reinterpret_cast<IUnknown **>(&s_fog_quad_vs),
+	                     reinterpret_cast<IUnknown **>(&s_fog_depth_ps), reinterpret_cast<IUnknown **>(&s_fog_ps),
+	                     reinterpret_cast<IUnknown **>(&s_fog_decl), reinterpret_cast<IUnknown **>(&s_fog_state),
+	                     reinterpret_cast<IUnknown **>(&s_fog_noise), reinterpret_cast<IUnknown **>(&s_fog_depth_tex),
+	                     reinterpret_cast<IUnknown **>(&s_fog_ds)}) {
+		if (*p) (*p)->Release();
+		*p = nullptr;
+	}
+}
+
+static float smooth01(float e0, float e1, float x)
+{
+	const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+	return t * t * (3 - 2 * t);
+}
+
+// After the game's EndScene (billboards drawn, UI not yet): depth pass + fog pass in our own Begin/EndScene.
+static void fog_render()
+{
+	if (!init_fog_resources())
+		return;
+	D3DSURFACE_DESC rd;
+	s_fog_rt->GetDesc(&rd);
+	D3DSURFACE_DESC dd = {};
+	if (s_fog_depth_tex)
+		s_fog_depth_tex->GetLevelDesc(0, &dd);
+	if (!s_fog_depth_tex || dd.Width != rd.Width || dd.Height != rd.Height) {
+		if (s_fog_depth_tex) s_fog_depth_tex->Release();
+		if (s_fog_ds) s_fog_ds->Release();
+		s_fog_depth_tex = nullptr;
+		s_fog_ds = nullptr;
+		HRESULT hr = s_dev->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &s_fog_depth_tex, nullptr);
+		if (FAILED(hr))
+			hr = s_dev->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R16F, D3DPOOL_DEFAULT, &s_fog_depth_tex, nullptr);
+		if (SUCCEEDED(hr))
+			hr = s_dev->CreateDepthStencilSurface(rd.Width, rd.Height, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, TRUE, &s_fog_ds, nullptr);
+		if (FAILED(hr)) {
+			log_info("mm7fx: fog depth target %ux%u failed 0x%08lx, fog disabled", rd.Width, rd.Height, hr);
+			if (s_fog_depth_tex) s_fog_depth_tex->Release();
+			s_fog_depth_tex = nullptr;
+			s_fog_init_failed = true;
+			return;
+		}
+		log_info("mm7fx: fog depth target %ux%u", rd.Width, rd.Height);
+	}
+
+	// time of day: sun rises in the east (+X) at 6:00, culminates in the south (-Y), sets in the west at 18:00
+	const int hour = std::clamp(*reinterpret_cast<const int32_t *>(mm7::GameHour), 0, 23);
+	const int minute = std::clamp(*reinterpret_cast<const int32_t *>(mm7::GameMinute), 0, 59);
+	const float ang = (hour + minute / 60.0f - 6.0f) / 12.0f * 3.14159265f;
+	const float sun[3] = {std::cos(ang), -std::sin(ang) * std::cos(fogcfg::SunNoonElev), std::sin(ang) * std::sin(fogcfg::SunNoonElev)};
+	const float day[3] = {0.70f, 0.76f, 0.84f}, dusk[3] = {0.78f, 0.58f, 0.46f}, night[3] = {0.045f, 0.06f, 0.11f};
+	const float low_sun[3] = {1.0f, 0.5f, 0.22f}, high_sun[3] = {1.0f, 0.92f, 0.78f};
+	float pal[3], sunc[3];
+	for (int k = 0; k < 3; ++k) {
+		pal[k] = sun[2] >= 0 ? dusk[k] + (day[k] - dusk[k]) * smooth01(0, 0.3f, sun[2])
+		                     : dusk[k] + (night[k] - dusk[k]) * smooth01(0, 0.18f, -sun[2]);
+		sunc[k] = low_sun[k] + (high_sun[k] - low_sun[k]) * smooth01(0, 0.4f, sun[2]);
+	}
+	// wind offsets wrapped to the noise period (1 / NoiseScale world units) so they never jump
+	const double t = GetTickCount() * 0.001, period = 1.0 / fogcfg::NoiseScale;
+	auto wrap = [&](double v) { return float(std::fmod(v, period)); };
+	const float far_d = s_fog_far > 1000 ? s_fog_far : 12000.0f;
+	const float zn = 16.0f, zf = 65536.0f;
+	const float vc[20] = {s_fog_proj[0], s_fog_proj[1], s_fog_proj[2], s_fog_proj[3],
+	                      s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1],
+	                      s_fog_dxw[0], s_fog_dxw[1], s_fog_dxw[2], s_fog_dxw[3],
+	                      s_fog_dxw[4], s_fog_dxw[5], s_fog_dxw[6], s_fog_dxw[7], zn, zf / (zf - zn), 0, 0};
+	const int32_t *rr = reinterpret_cast<const int32_t *>(mm7::RenderRect);
+	const float pc[14 * 4] = {
+		1.0f / rd.Width, 1.0f / rd.Height, s_fog_sky_ok ? 1.0f : 0.0f, 0,
+		float(s_fog_vp.X), float(s_fog_vp.Y), float(s_fog_vp.Width), float(s_fog_vp.Height),
+		s_fog_rx[0], s_fog_rx[1], s_fog_rx[2], s_fog_cam[0],
+		s_fog_ry[0], s_fog_ry[1], s_fog_ry[2], s_fog_cam[1],
+		s_fog_rz[0], s_fog_rz[1], s_fog_rz[2], s_fog_cam[2],
+		sun[0], sun[1], sun[2], smooth01(-0.06f, 0.04f, sun[2]),
+		pal[0], pal[1], pal[2], s_fog_base_z,
+		sunc[0], sunc[1], sunc[2], far_d,
+		fogcfg::Density, 1.0f / fogcfg::HeightFalloff, fogcfg::MaxDist, fogcfg::NoiseScale,
+		wrap(fogcfg::WindX * t), wrap(fogcfg::WindY * t), wrap(fogcfg::WindX * 1.6 * t), wrap(fogcfg::WindY * 1.6 * t),
+		float(rr[0]), float(rr[1]), float(rr[2]), float(rr[3]),
+		fogcfg::SunG, fogcfg::SunGlow, fogcfg::SkyHazeElev, fogcfg::EdgeStart,
+		fogcfg::FogStart, 1.0f / fogcfg::FogRamp, 0, 0,
+		0, 0, 0, 0}; // atest
+
+	const bool began = SUCCEEDED(s_dev->BeginScene());
+	s_fog_state->Capture();
+	IDirect3DSurface9 *prev_rt = nullptr, *prev_ds = nullptr, *depth_rt = nullptr;
+	s_dev->GetRenderTarget(0, &prev_rt);
+	s_dev->GetDepthStencilSurface(&prev_ds);
+	s_fog_depth_tex->GetSurfaceLevel(0, &depth_rt);
+
+	// 1. linear depth
+	s_dev->SetRenderTarget(0, depth_rt);
+	s_dev->SetDepthStencilSurface(s_fog_ds);
+	s_dev->SetViewport(&s_fog_vp);
+	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+	s_dev->SetVertexShaderConstantF(0, vc, 5);
+	s_dev->SetPixelShaderConstantF(0, vc, 5);
+	s_dev->SetPixelShaderConstantF(5, pc, 14);
+	s_dev->SetVertexDeclaration(s_fog_decl);
+	s_dev->SetVertexShader(s_fog_depth_vs);
+	s_dev->SetPixelShader(s_fog_depth_ps);
+	s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+	s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+	s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+	s_dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	s_dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+	s_dev->SetTexture(0, nullptr);
+	constexpr size_t chunk = 3 * 20000;
+	for (size_t i = 0; i < s_fog_tris.size(); i += chunk)
+		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, static_cast<UINT>(std::min(chunk, s_fog_tris.size() - i) / 3), &s_fog_tris[i], sizeof(MirrorVertex));
+	const float at[4] = {1, 0, 0, 0};
+	s_dev->SetPixelShaderConstantF(18, at, 1);
+	for (DWORD s = 0; s < 3; ++s) {
+		s_dev->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
+		s_dev->SetSamplerState(s, D3DSAMP_ADDRESSU, s == 2 ? D3DTADDRESS_WRAP : D3DTADDRESS_CLAMP);
+		s_dev->SetSamplerState(s, D3DSAMP_ADDRESSV, s == 2 ? D3DTADDRESS_WRAP : D3DTADDRESS_CLAMP);
+		s_dev->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+		s_dev->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+		s_dev->SetSamplerState(s, D3DSAMP_MIPFILTER, s == 0 ? D3DTEXF_LINEAR : D3DTEXF_NONE); // billboard alpha: mips
+	}
+	for (const auto &p : s_bb_polys) { // ponytail: one draw per billboard; batch by texture like the mirror if it shows up in profiles
+		s_dev->SetTexture(0, p.tex);
+		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_bb_verts[p.first], sizeof(MirrorVertex));
+	}
+
+	// 2. fog over the game's 3D view
+	s_dev->SetRenderTarget(0, s_fog_rt);
+	s_dev->SetDepthStencilSurface(nullptr);
+	s_dev->SetViewport(&s_fog_vp);
+	s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+	s_dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+	s_dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+	s_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_SRCALPHA);
+	s_dev->SetVertexShader(s_fog_quad_vs);
+	s_dev->SetPixelShader(s_fog_ps);
+	s_dev->SetTexture(0, s_fog_depth_tex);
+	s_dev->SetTexture(1, s_fog_sky_ok ? s_sky_tex : nullptr);
+	s_dev->SetTexture(2, s_fog_noise);
+	s_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT); // depth: never filter across silhouettes
+	s_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+	s_dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x7); // leave the target's alpha alone
+	const float l = float(rr[0]), tp = float(rr[1]), r = float(rr[2]), b = float(rr[3]);
+	const MirrorVertex quad[4] = {{l, tp, 0, 0, 0, 0}, {r, tp, 0, 0, 0, 0}, {r, b, 0, 0, 0, 0}, {l, b, 0, 0, 0, 0}};
+	s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(MirrorVertex));
+
+	if (prev_rt) s_dev->SetRenderTarget(0, prev_rt);
+	s_dev->SetDepthStencilSurface(prev_ds);
+	s_fog_state->Apply(); // after the targets: SetRenderTarget resets the viewport
+	if (prev_rt) prev_rt->Release();
+	if (prev_ds) prev_ds->Release();
+	depth_rt->Release();
+	if (began)
+		s_dev->EndScene();
+	static DWORD last = 0;
+	if (GetTickCount() - last > 5000) {
+		last = GetTickCount();
+		log_info("mm7fx dbg: fog %zu tris %zu billboards, cam (%.0f %.0f %.0f) up (%.3f %.3f %.3f) water z %.0f far %.0f, %02d:%02d sun z %.2f",
+			s_fog_tris.size() / 3, s_bb_polys.size(), s_fog_cam[0], s_fog_cam[1], s_fog_cam[2], s_fog_rz[0], s_fog_rz[1], s_fog_rz[2],
+			s_fog_base_z, far_d, hour, minute, sun[2]);
+	}
+}
+
 // ---- hooks -----------------------------------------------------------------------------------
 
 using DrawTerrainPolygonFn = void(__fastcall *)(void *self, void *edx, uint32_t n, uint8_t *poly, void *tex, int transparent, int clamp);
@@ -1135,6 +1687,7 @@ static void __fastcall hook_end_scene(void *self, void *edx)
 			// Full 3D scene: next frame's reflection source.
 			s_scene_ready = copy_scene();
 		}
+		const bool fog = fog_prepare(); // needs this frame's projection fit and sky flag, released below
 		release_captured();
 		mirror_release_captured();
 		if (mirror_wanted() && s_dev) {
@@ -1145,6 +1698,10 @@ static void __fastcall hook_end_scene(void *self, void *edx)
 		}
 		s_orig_end_scene(self, edx);
 		s_bb_capture = false;
+		// billboards are drawn, the UI is not: fog over the finished 3D view (s_bb_* = this frame's billboards)
+		if (fog)
+			fog_render();
+		fog_release_captured();
 		return;
 	}
 	s_orig_end_scene(self, edx);
@@ -1165,6 +1722,7 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 	if (!s_dev)
 		s_dev = reinterpret_cast<IDirect3DDevice9 *>(static_cast<uintptr_t>(cmd->get_device()->get_native()));
 	mirror_on_draw();
+	fog_on_draw();
 	if (s_bb_capture) {
 		bb_on_draw();
 		return false;
@@ -1261,6 +1819,7 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
 			}
 			std::fclose(f);
 		}
+		fog_poll_toggle();
 	}
 
 	const DWORD now = GetTickCount();
@@ -1280,6 +1839,7 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
 	s_water_drawn_this_frame = false;
 	release_captured(); // safety: never carry captures across frames
 	mirror_release_captured();
+	fog_release_captured();
 }
 
 static void on_destroy_device(device *)
@@ -1287,6 +1847,7 @@ static void on_destroy_device(device *)
 	bb_release();
 	release_captured();
 	release_mirror_resources();
+	fog_release_resources();
 	if (s_state) s_state->Release();
 	if (s_water_ps) s_water_ps->Release();
 	if (s_overlay_ps) s_overlay_ps->Release();
