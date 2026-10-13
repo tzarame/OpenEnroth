@@ -2,7 +2,7 @@
 // Target: GOG mm7.exe 1.21 + GrayFace patch 2.5.7. Addresses: ../../re/water.md
 //
 // v1: detours Render::DrawTerrainPolygon so draw events can tell which terrain tile is being drawn.
-//     Water tiles (Polygon::flags & 2) are counted; F10 toggles hiding them (proof of detection).
+//     F10 cycles: normal -> hide water tiles (Polygon::flags & 2) -> hide all terrain (proof of detection/skipping).
 #include <reshade.hpp>
 #include <atomic>
 #include <cstdio>
@@ -67,19 +67,26 @@ static bool drawing_water()
 
 // ---- render side -----------------------------------------------------------------------------
 
-static std::atomic<uint32_t> s_draws{0}, s_water_draws{0};
-static bool s_hide_water = false;
+static std::atomic<uint32_t> s_draws{0}, s_water_draws{0}, s_terrain_draws{0}, s_skipped{0};
+enum class Hide { None, Water, Terrain };
+static Hide s_hide = Hide::None;
+static bool s_f10_was_down = false;
 static uint32_t s_frame = 0;
 static DWORD s_last_log = 0;
 
 static bool on_draw(command_list *, uint32_t, uint32_t, uint32_t, uint32_t)
 {
 	++s_draws;
-	if (drawing_water()) {
+	if (!s_current_poly)
+		return false;
+	++s_terrain_draws;
+	const bool water = drawing_water();
+	if (water)
 		++s_water_draws;
-		return s_hide_water; // true = skip this draw
-	}
-	return false;
+	const bool skip = s_hide == Hide::Terrain || (s_hide == Hide::Water && water);
+	if (skip)
+		++s_skipped;
+	return skip; // true = skip this draw
 }
 
 static bool on_draw_indexed(command_list *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
@@ -94,22 +101,27 @@ static bool on_draw_indexed(command_list *, uint32_t, uint32_t, uint32_t, int32_
 static void on_present(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *)
 {
 	++s_frame;
-	if (GetAsyncKeyState(VK_F10) & 1) {
-		s_hide_water = !s_hide_water;
-		reshade::log::message(reshade::log::level::info, s_hide_water ? "mm7fx: water hidden" : "mm7fx: water shown");
+	const bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+	if (f10 && !s_f10_was_down) {
+		s_hide = static_cast<Hide>((static_cast<int>(s_hide) + 1) % 3);
+		static const char *const names[] = {"mm7fx: mode = normal", "mm7fx: mode = hide water", "mm7fx: mode = hide all terrain"};
+		reshade::log::message(reshade::log::level::info, names[static_cast<int>(s_hide)]);
 	}
+	s_f10_was_down = f10;
 
 	const DWORD now = GetTickCount();
 	if (now - s_last_log >= 5000) {
 		s_last_log = now;
 		const float *v0 = reinterpret_cast<const float *>(mm7::SoftVertices);
 		char buf[256];
-		std::snprintf(buf, sizeof(buf), "mm7fx: frame %u: %u draws, %u water, last soft vertex world (%.0f, %.0f, %.0f)",
-			s_frame, s_draws.load(), s_water_draws.load(), v0[0], v0[1], v0[2]);
+		std::snprintf(buf, sizeof(buf), "mm7fx: frame %u: %u draws, %u terrain, %u water, %u skipped, mode %d, soft vertex[0] world (%.0f, %.0f, %.0f)",
+			s_frame, s_draws.load(), s_terrain_draws.load(), s_water_draws.load(), s_skipped.load(), static_cast<int>(s_hide), v0[0], v0[1], v0[2]);
 		reshade::log::message(reshade::log::level::info, buf);
 	}
 	s_draws = 0;
 	s_water_draws = 0;
+	s_terrain_draws = 0;
+	s_skipped = 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
