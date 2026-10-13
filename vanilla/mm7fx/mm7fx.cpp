@@ -87,7 +87,11 @@ static bool on_draw_indexed(command_list *, uint32_t, uint32_t, uint32_t, int32_
 	return on_draw(nullptr, 0, 0, 0, 0);
 }
 
-static void on_present(command_queue *, swapchain *sc, const rect *, const rect *, uint32_t, const rect *)
+// ABI note: this add-on is built with MinGW GCC, ReShade with MSVC. MSVC returns user-defined types from member
+// functions through a hidden pointer, GCC (for 8-byte structs) in EDX:EAX. Never call ReShade methods that return
+// structs (get_back_buffer, get_resource_desc, get_resource_from_view, ...) directly; wrap them with an explicit
+// __thiscall vtable call taking the result pointer.
+static void on_present(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *)
 {
 	++s_frame;
 	if (GetAsyncKeyState(VK_F10) & 1) {
@@ -98,11 +102,10 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 	const DWORD now = GetTickCount();
 	if (now - s_last_log >= 5000) {
 		s_last_log = now;
-		const resource_desc d = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
 		const float *v0 = reinterpret_cast<const float *>(mm7::SoftVertices);
 		char buf[256];
-		std::snprintf(buf, sizeof(buf), "mm7fx: frame %u: %u draws, %u water, backbuffer %ux%u, last soft vertex world (%.0f, %.0f, %.0f)",
-			s_frame, s_draws.load(), s_water_draws.load(), d.texture.width, d.texture.height, v0[0], v0[1], v0[2]);
+		std::snprintf(buf, sizeof(buf), "mm7fx: frame %u: %u draws, %u water, last soft vertex world (%.0f, %.0f, %.0f)",
+			s_frame, s_draws.load(), s_water_draws.load(), v0[0], v0[1], v0[2]);
 		reshade::log::message(reshade::log::level::info, buf);
 	}
 	s_draws = 0;
