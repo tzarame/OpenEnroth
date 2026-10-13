@@ -398,8 +398,10 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : 
 	float2 gp = to_game(vpos + 0.5);
 	float2 suv = gp * extra.z;                         // ~0..1 scale for ripple frequencies
 	float time = params.x;
-	float2 rip = float2(sin(suv.y * 260.0 + time * 2.1) + sin(suv.x * 90.0 - time * 1.3),
-	                    sin(suv.x * 170.0 + time * 1.7)) * 0.0025;
+	// ripples follow the waves painted in the water texture: its brightness is used as a height map and the
+	// screen-space gradient bends the reflection along the wave crests (the texture itself is animated by the game)
+	float hgt = dot(tex2D(waterTex, uv).rgb, float3(0.299, 0.587, 0.114));
+	float2 rip = float2(ddx(hgt), ddy(hgt)) * 0.06 + float2(sin(time * 0.7 + suv.y * 40.0), 0.0) * 0.0006;
 	float y = gp.y;                                    // game screen px
 	float t = (y - params.y) / params.z;               // tan of the view-space vertical angle
 	float tr = (params.w - t) / (1.0 + params.w * t);  // mirrored about the horizon angle
@@ -584,6 +586,56 @@ static IDirect3DVertexShader9 *s_mirror_vs = nullptr;
 static IDirect3DPixelShader9 *s_mirror_ps = nullptr;
 static IDirect3DVertexDeclaration9 *s_mirror_decl = nullptr;
 static bool s_mirror_init_failed = false;
+
+// Billboards (trees, monsters, decorations) are drawn by the game after our mirror pass, from its D3D list
+// (count 0xF1B298, entries of 0x9C bytes at 0xEF5138: +0 D3D7 texture, +4 vertex count, +8 TL quad[4]).
+// We capture them while the game draws them (D3D9 texture from the draw, vertices from the list entry) and add them
+// to the next frame's mirror pass.
+namespace mm7 {
+constexpr uintptr_t BillboardCount = 0xF1B298;
+constexpr uintptr_t BillboardList = 0xEF5138;
+constexpr size_t BillboardStride = 0x9C;
+}
+static bool s_bb_capture = false;
+static uint32_t s_bb_index = 0, s_bb_count = 0;
+static std::vector<MirrorPoly> s_bb_polys;
+static std::vector<MirrorVertex> s_bb_verts;
+static float s_mir_last_fit[4] = {}; // ax, bx, ay, by of the last mirror pass
+static bool s_mir_last_fit_ok = false;
+
+static void bb_release()
+{
+	for (auto &p : s_bb_polys)
+		if (p.tex) p.tex->Release();
+	s_bb_polys.clear();
+	s_bb_verts.clear();
+}
+
+// on_draw while the game draws its billboard list (back to front: entry count-1 first)
+static void bb_on_draw()
+{
+	if (s_bb_index >= s_bb_count || !s_mir_last_fit_ok)
+		return;
+	const uint8_t *e = reinterpret_cast<const uint8_t *>(mm7::BillboardList) + (s_bb_count - 1 - s_bb_index) * mm7::BillboardStride;
+	++s_bb_index;
+	const uint32_t n = *reinterpret_cast<const uint32_t *>(e + 4);
+	if (n < 3 || n > 4)
+		return;
+	const auto *tl = reinterpret_cast<const mm7::TLVertex *>(e + 8);
+	const float ax = s_mir_last_fit[0], bx = s_mir_last_fit[1], ay = s_mir_last_fit[2], by = s_mir_last_fit[3];
+	MirrorPoly p = {nullptr, static_cast<uint32_t>(s_bb_verts.size()), n};
+	for (uint32_t i = 0; i < n; ++i) {
+		if (tl[i].rhw <= 0)
+			return;
+		const float vx = 1.0f / tl[i].rhw; // billboard rhw = 1 / view depth
+		s_bb_verts.push_back({vx, (tl[i].x - ax) * vx / bx, (tl[i].y - ay) * vx / by, tl[i].diffuse, tl[i].u, tl[i].v});
+	}
+	s_dev->GetTexture(0, &p.tex);
+	if (p.tex)
+		s_bb_polys.push_back(p);
+	else
+		s_bb_verts.resize(p.first);
+}
 
 static bool mirror_wanted()
 {
@@ -773,6 +825,16 @@ static bool mirror_render()
 	float ax, bx, ay, by;
 	if (!s_mir_fit_x.solve(ax, bx) || !s_mir_fit_y.solve(ay, by) || !(bx * by > 0) || bx / by < 0.5f || bx / by > 2.0f)
 		return false; // not the expected pinhole projection (cx - f*y/x, cy - f*z/x)
+	s_mir_last_fit[0] = ax; s_mir_last_fit[1] = bx; s_mir_last_fit[2] = ay; s_mir_last_fit[3] = by;
+	s_mir_last_fit_ok = true;
+	// previous frame's billboards join the mirrored geometry (references move to s_mir_polys)
+	for (auto p : s_bb_polys) {
+		p.first += static_cast<uint32_t>(s_mir_verts.size());
+		s_mir_polys.push_back(p);
+	}
+	s_mir_verts.insert(s_mir_verts.end(), s_bb_verts.begin(), s_bb_verts.end());
+	s_bb_polys.clear();
+	s_bb_verts.clear();
 	float nrm[3] = {s_fit.up[0], s_fit.up[1], s_fit.up[2]};
 	const float len = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
 	if (len < 1e-6f)
@@ -1083,6 +1145,15 @@ static void __fastcall hook_end_scene(void *self, void *edx)
 		}
 		release_captured();
 		mirror_release_captured();
+		if (mirror_wanted() && s_dev) {
+			bb_release(); // anything not consumed by a mirror pass
+			s_bb_count = *reinterpret_cast<const uint32_t *>(mm7::BillboardCount);
+			s_bb_index = 0;
+			s_bb_capture = s_bb_count > 0 && s_bb_count < 2000;
+		}
+		s_orig_end_scene(self, edx);
+		s_bb_capture = false;
+		return;
 	}
 	s_orig_end_scene(self, edx);
 }
@@ -1102,6 +1173,10 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 	if (!s_dev)
 		s_dev = reinterpret_cast<IDirect3DDevice9 *>(static_cast<uintptr_t>(cmd->get_device()->get_native()));
 	mirror_on_draw();
+	if (s_bb_capture) {
+		bb_on_draw();
+		return false;
+	}
 	if (!s_current_poly)
 		return false;
 	++s_terrain_draws;
@@ -1217,6 +1292,7 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
 
 static void on_destroy_device(device *)
 {
+	bb_release();
 	release_captured();
 	release_mirror_resources();
 	if (s_state) s_state->Release();
