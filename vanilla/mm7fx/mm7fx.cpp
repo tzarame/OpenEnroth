@@ -1283,12 +1283,12 @@ static void draw_water_batch()
 // Toggle: Effect mode only, and mm7fx_fog.txt (0/1, default 1) in the game folder, polled like mm7fx_mode.txt.
 
 namespace fogcfg { // MM7 units: a terrain tile is 512
-constexpr float Density = 1.7e-4f;     // extinction per unit at water level, fully inside the fog
-constexpr float HeightFalloff = 1800;  // H: density * exp(-height above water / H)
+constexpr float Density = 2.6e-4f;     // extinction per unit at water level, fully inside the fog
+constexpr float HeightFalloff = 450;   // H of the dense ground layer (the thin haze above uses 2500, in the shader)
 constexpr float MaxDist = 20000;       // march length cap (sky rays use all of it)
-constexpr float FogStart = 1000;       // no fog closer than this ...
-constexpr float FogRamp = 5000;        // ... full density from FogStart + FogRamp on
-constexpr float NoiseScale = 1.0f / (128 * 1500); // noise texture (128 texels) uv per world unit: ~1500-unit blobs
+constexpr float FogStart = 250;       // no fog closer than this ...
+constexpr float FogRamp = 1800;        // ... full density from FogStart + FogRamp on
+constexpr float NoiseScale = 1.0f / (128 * 900);  // noise texture (128 texels) uv per world unit: ~900-unit banks
 constexpr float WindX = 90, WindY = 40; // units/s; the fine octave drifts 1.6x faster
 constexpr float SunGlow = 0.45f;       // forward-scattering glow strength toward the sun
 constexpr float SunG = 0.55f;          // Henyey-Greenstein anisotropy of the glow
@@ -1545,7 +1545,7 @@ float4 sky_near_horizon(float x)
 	return float4(tex2Dlod(skyTex, float4(to_rt_uv(float2(x, clamp(y, view.y, view.w))), 0.0, 0.0)).rgb * ok, ok);
 }
 
-static const int Steps = 12;
+static const int Steps = 20;
 float4 ps_fog(float2 vpos : VPOS) : COLOR
 {
 	float2 px = vpos + 0.5;
@@ -1563,11 +1563,14 @@ float4 ps_fog(float2 vpos : VPOS) : COLOR
 	[loop] for (int i = 0; i < Steps; ++i) {
 		float s = (i + jit) * stp;
 		float3 p = cam + wd * s;
-		float hd = exp(-max(p.z - pal.w, 0.0) * dens.y);
+		float h = max(p.z - pal.w, 0.0);
 		float2 q = p.xy + p.z * float2(0.6, 0.35); // height shears the 2D noise: blobs change with altitude
 		float n = tex2Dlod(noiseTex, float4((q + drift.xy) * dens.w, 0.0, 0.0)).r * 0.65
 		        + tex2Dlod(noiseTex, float4((q + drift.zw) * dens.w * 3.0, 0.0, 0.0)).g * 0.35;
-		tau += hd * (0.55 + 0.45 * n) * saturate((s - ramp.x) * ramp.y);
+		// banks with gaps hugging water and hollows + a thin haze higher up
+		float bank = pow(saturate(n * 1.7 - 0.45), 1.4) * 2.4;
+		float dn = exp(-h * dens.y) * bank + 0.22 * exp(-h * (1.0 / 2500.0));
+		tau += dn * saturate((s - ramp.x) * ramp.y);
 	}
 	float T = exp(-tau * dens.x * stp);
 	if (sky)
