@@ -1329,6 +1329,10 @@ static bool fog_wanted()
 {
 	return s_mode == Mode::Effect && s_fog_on;
 }
+static bool shadows_wanted();  // sun shadows + AO section: also needs this frame's captures and linear depth
+static bool shadows_debug();
+static void shadows_render(const float sun[3]);
+static bool fx_depth_wanted() { return fog_wanted() || shadows_wanted(); }
 
 static void fog_poll_toggle()
 {
@@ -1345,7 +1349,7 @@ static void fog_poll_toggle()
 // from mirror_end, for every terrain/building polygon (soft vertices are final)
 static void fog_capture_poly(uint32_t n, bool terrain, bool water)
 {
-	if (!fog_wanted())
+	if (!fx_depth_wanted())
 		return;
 	const auto *sv = reinterpret_cast<const mm7::SoftVertex *>(mm7::SoftVertices);
 	for (uint32_t k = 2; k < n; ++k)
@@ -1437,7 +1441,7 @@ static bool fog_solve_basis()
 // from on_draw: the game's target, viewport and dxwrapper constants are live during the first captured draw
 static void fog_on_draw()
 {
-	if (!s_mir_n || !fog_wanted())
+	if (!s_mir_n || !fx_depth_wanted())
 		return;
 	if (!s_fog_rt) {
 		s_dev->GetViewport(&s_fog_vp);
@@ -1465,7 +1469,7 @@ static void fog_release_captured()
 // before the captures are released (projection fit, sky flag); also gives bb_on_draw this frame's projection
 static bool fog_prepare()
 {
-	if (!fog_wanted() || !s_dev || !s_fog_terrain || !s_fog_rt || s_fog_tris.empty() || !s_fog_vp.Width || !s_fog_vp.Height)
+	if (!fx_depth_wanted() || !s_dev || !s_fog_terrain || !s_fog_rt || s_fog_tris.empty() || !s_fog_vp.Width || !s_fog_vp.Height)
 		return false;
 	float ax, bx, ay, by;
 	if (!s_mir_fit_x.solve(ax, bx) || !s_mir_fit_y.solve(ay, by) || !(bx * by > 0) || bx / by < 0.5f || bx / by > 2.0f)
@@ -1784,7 +1788,9 @@ static void fog_render()
 		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_bb_verts[p.first], sizeof(MirrorVertex));
 	}
 
+	shadows_render(sun); // sun shadows + AO under the fog
 	// 2. fog over the game's 3D view
+	if (fog_wanted() && !shadows_debug()) {
 	s_dev->SetRenderTarget(0, s_fog_rt);
 	s_dev->SetDepthStencilSurface(nullptr);
 	s_dev->SetViewport(&s_fog_vp);
@@ -1806,6 +1812,7 @@ static void fog_render()
 	const float l = float(rr[0]), tp = float(rr[1]), r = float(rr[2]), b = float(rr[3]);
 	const MirrorVertex quad[4] = {{l, tp, 0, 0, 0, 0}, {r, tp, 0, 0, 0, 0}, {r, b, 0, 0, 0, 0}, {l, b, 0, 0, 0, 0}};
 	s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(MirrorVertex));
+	}
 
 	if (prev_rt) s_dev->SetRenderTarget(0, prev_rt);
 	s_dev->SetDepthStencilSurface(prev_ds);
@@ -1821,6 +1828,474 @@ static void fog_render()
 		log_info("mm7fx dbg: fog %zu tris %zu billboards, cam (%.0f %.0f %.0f) up (%.3f %.3f %.3f) water z %.0f far %.0f, %02d:%02d sun z %.2f",
 			s_fog_tris.size() / 3, s_bb_polys.size(), s_fog_cam[0], s_fog_cam[1], s_fog_cam[2], s_fog_rz[0], s_fog_rz[1], s_fog_rz[2],
 			s_fog_base_z, far_d, hour, minute, sun[2]);
+	}
+}
+
+// ---- sun shadows + ambient occlusion ---------------------------------------------------------
+// Runs inside fog_render, after its linear-depth pass and before the fog itself (also when the fog is off).
+//  1. shadow map: this frame's captured geometry (s_fog_tris, view space) and billboards (alpha-tested, turned to face
+//     the sun about their vertical axis and pushed away from it so they don't shadow themselves) rendered from the
+//     sun with an orthographic projection over Extent x Extent world units centred Ahead of the camera, origin snapped
+//     to texels; R32F holds the light-space z (smaller = nearer the sun), cleared to 1 = no caster.
+//  2. half resolution: per pixel view position from the fog's linear depth, normal from neighbour depths, 4x4 tent PCF
+//     with normal offset + slope-scaled bias, back faces to the sun shaded; 12-sample screen-space AO (normal-cosine
+//     weighted, 2x2 rotated pattern). Output r = AO, g = sun visibility, b = depth.
+//  3. full resolution: depth-aware 4x4 upsample (also removes the AO pattern), multiplied into the 3D view
+//     (DESTCOLOR, ZERO): lerp(ShadowColor, 1, visibility) * AO.
+// Casters are only what the game drew this frame (inside the view): off-screen buildings cast nothing.
+// Toggle: Effect mode only, and mm7fx_shadows.txt (0 off, 1 on, 2 debug: the factor as grey over the 3D view, no fog).
+
+namespace shcfg { // MM7 units: a terrain tile is 512
+constexpr int MapSize = 2048;          // shadow map texels per side
+constexpr float Extent = 6000;         // world units covered by the map (perpendicular to the sun)
+constexpr float Ahead = 1500;          // map centre this far ahead of the camera (horizontally)
+constexpr float DepthRange = 20000;    // light-space depth +- around the centre
+constexpr float Strength = 1.0f;       // 1: fully shadowed pixels get ShadowColor
+constexpr float ShadowColor[3] = {0.58f, 0.60f, 0.68f}; // multiplier in full shadow (ambient, slightly blue)
+constexpr float FadeStart = 2200, FadeEnd = 3200; // shadows fade out with camera distance
+constexpr float SunLow = 0.04f, SunHigh = 0.25f; // shadows fade in with sin(sun elevation) between these
+constexpr float Bias = 6;              // world units along the sun
+constexpr float SlopeBias = 1.5f;      // shadow-map texels * tan(angle to the sun), capped at 6
+constexpr float NormalOffset = 4;      // receiver pushed along its normal, world units
+constexpr float BackfaceShade = 0.6f;  // 0..1: surfaces facing away from the sun count as shadowed
+constexpr float BillboardPush = 0.7f;  // billboard casters pushed away from the sun by this * half width
+constexpr float AoRadius = 90;         // world units
+constexpr float AoStrength = 0.6f;
+constexpr float AoMaxPx = 40;          // screen radius cap, game px (640x480)
+constexpr float AoCosBias = 0.15f;     // ignore occluders flatter than this (cosine to the normal)
+constexpr float AoFadeStart = 3000, AoFadeEnd = 6000;
+}
+
+static int s_sh_mode = 1; // mm7fx_shadows.txt
+static IDirect3DTexture9 *s_sh_map = nullptr, *s_sh_half = nullptr;
+static IDirect3DSurface9 *s_sh_map_ds = nullptr;
+static IDirect3DVertexShader9 *s_sh_vs_map = nullptr, *s_sh_vs_quad = nullptr;
+static IDirect3DPixelShader9 *s_sh_ps_map = nullptr, *s_sh_ps_half = nullptr, *s_sh_ps_apply = nullptr;
+static IDirect3DStateBlock9 *s_sh_state = nullptr;
+static bool s_sh_init_failed = false;
+static std::vector<MirrorVertex> s_sh_bb; // billboards turned to the sun
+
+static bool shadows_wanted() { return s_mode == Mode::Effect && s_sh_mode != 0; }
+static bool shadows_debug() { return shadows_wanted() && s_sh_mode == 2; }
+
+static void shadows_poll_toggle()
+{
+	if (FILE *f = std::fopen("mm7fx_shadows.txt", "r")) {
+		int v = 1;
+		if (std::fscanf(f, "%d", &v) == 1 && v >= 0 && v <= 2 && v != s_sh_mode) {
+			s_sh_mode = v;
+			log_info("mm7fx: shadows %d (from mm7fx_shadows.txt)", v);
+		}
+		std::fclose(f);
+	}
+}
+
+static const char s_sh_src[] = R"(
+sampler2D tex0 : register(s0);    // map pass: billboard texture; other passes: linear depth (0 = sky)
+sampler2D smap : register(s1);    // shadow map
+sampler2D halfTex : register(s2); // half res: r = AO, g = sun visibility, b = depth
+float4 proj : register(c0);  // game px = proj.x + proj.y * y / x, py = proj.z + proj.w * z / x (view: x fwd, z up)
+float4 gf : register(c1);    // GrayFace HD scaling
+float4 off : register(c2);   // dxwrapper fix-up offset
+float4 mul : register(c3);   // dxwrapper fix-up multiplier
+float4 rt : register(c4);    // 1/RT width, 1/RT height, 1/half width, 1/half height
+float4 vp : register(c5);    // viewport X, Y, W, H
+float4 lr0 : register(c6);   // view -> light space rows (world units): x, y across the map, z toward the sun
+float4 lr1 : register(c7);
+float4 lr2 : register(c8);
+float4 sunv : register(c9);  // xyz: view-space direction to the sun, w: shadow strength (0 at night)
+float4 sm : register(c10);   // 1 / half extent, 1 / (2 * depth range), map size, texel size (world)
+float4 bias : register(c11); // bias, slope bias (texels), normal offset, back-face shade
+float4 fade : register(c12); // shadow fade start, 1 / length, AO fade start, 1 / length
+float4 aoc : register(c13);  // AO radius, strength, max radius (game px), cosine bias
+float4 col : register(c14);  // rgb: shadow colour, w: debug
+float4 atest : register(c15);// x = 1: alpha-test tex0
+
+struct MOut { float4 pos : POSITION; float2 uv : TEXCOORD0; float z : TEXCOORD1; };
+MOut vs_map(float3 pos : POSITION, float2 uv : TEXCOORD0)
+{
+	float3 l = float3(dot(lr0.xyz, pos) + lr0.w, dot(lr1.xyz, pos) + lr1.w, dot(lr2.xyz, pos) + lr2.w);
+	MOut o;
+	o.pos = float4(l.xy * sm.x, 0.5 - l.z * sm.y, 1.0);
+	o.uv = uv;
+	o.z = o.pos.z;
+	return o;
+}
+float4 ps_map(float2 uv : TEXCOORD0, float z : TEXCOORD1) : COLOR
+{
+	clip(atest.x > 0.5 ? tex2D(tex0, uv).a - 0.5 : 1.0);
+	return float4(z, 0.0, 0.0, 1.0);
+}
+float4 vs_quad(float3 pos : POSITION) : POSITION // pos.xy in game screen coords
+{
+	return float4((pos.xy * gf.xy + gf.zw + off.xy) * mul.xy, 0.0, 1.0);
+}
+
+float2 to_game(float2 px)
+{
+	float2 ndc = float2((px.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (px.y - vp.y) / vp.w * 2.0);
+	return ((ndc / mul.xy - off.xy) - gf.zw) / gf.xy;
+}
+float2 to_rt_uv(float2 g)
+{
+	float2 ndc = (g * gf.xy + gf.zw + off.xy) * mul.xy;
+	return float2(vp.x + (ndc.x + 1.0) * 0.5 * vp.z, vp.y + (1.0 - ndc.y) * 0.5 * vp.w) * rt.xy;
+}
+float3 view_dir(float2 g) { return float3(1.0, (g.x - proj.x) / proj.y, (g.y - proj.z) / proj.w); }
+float depth_at(float2 px) { return tex2Dlod(tex0, float4(px * rt.xy, 0.0, 0.0)).r; }
+float3 view_at(float2 px, float d) { return d * view_dir(to_game(px)); }
+
+float4 ps_half(float2 vpos : VPOS) : COLOR
+{
+	float2 px = vpos * 2.0 + 0.5; // full-res pixel 2 * vpos
+	float d = depth_at(px);
+	if (d <= 0.0)
+		return float4(1.0, 1.0, 0.0, 1.0);
+	float3 P = view_at(px, d);
+	// normal from the neighbour on the side with the smaller depth step (no smearing across silhouettes)
+	float dl = depth_at(px - float2(1.0, 0.0)), dr = depth_at(px + float2(1.0, 0.0));
+	float du = depth_at(px - float2(0.0, 1.0)), dd = depth_at(px + float2(0.0, 1.0));
+	float3 ex = abs(dr - d) < abs(d - dl) ? view_at(px + float2(1.0, 0.0), dr) - P : P - view_at(px - float2(1.0, 0.0), dl);
+	float3 ey = abs(dd - d) < abs(d - du) ? view_at(px + float2(0.0, 1.0), dd) - P : P - view_at(px - float2(0.0, 1.0), du);
+	float3 N = normalize(cross(ex, ey));
+	N = dot(N, P) > 0.0 ? -N : N;
+	float dist = length(P);
+
+	// --- sun shadow ---
+	float vis = 1.0;
+	float sf = sunv.w * (1.0 - saturate((dist - fade.x) * fade.y));
+	if (sf > 0.001) {
+		float ndl = dot(N, sunv.xyz);
+		float3 Q = P + N * bias.z;
+		float3 l = float3(dot(lr0.xyz, Q) + lr0.w, dot(lr1.xyz, Q) + lr1.w, dot(lr2.xyz, Q) + lr2.w);
+		float2 uv = float2(l.x * sm.x * 0.5 + 0.5, 0.5 - l.y * sm.x * 0.5) + 0.5 / sm.z; // D3D9 half-texel
+		sf *= 1.0 - smoothstep(0.85, 1.0, max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0);
+		float tanl = sqrt(saturate(1.0 - ndl * ndl)) / max(abs(ndl), 0.05);
+		float rz = 0.5 - l.z * sm.y - (bias.x + bias.y * sm.w * min(tanl, 6.0)) * sm.y;
+		// 4x4 texels, tent weights = 3x3 box PCF convolved with bilinear
+		float2 tc = uv * sm.z - 0.5;
+		float2 b0 = floor(tc), f = tc - b0;
+		float acc = 0.0;
+		[unroll] for (int j = -1; j <= 2; ++j) {
+			float wy = j == -1 ? 1.0 - f.y : (j == 2 ? f.y : 1.0);
+			[unroll] for (int i = -1; i <= 2; ++i) {
+				float wx = i == -1 ? 1.0 - f.x : (i == 2 ? f.x : 1.0);
+				float s = tex2Dlod(smap, float4((b0 + float2(i, j) + 0.5) / sm.z, 0.0, 0.0)).r;
+				acc += wx * wy * (s >= rz ? 1.0 : 0.0);
+			}
+		}
+		float lit = min(acc / 9.0, lerp(1.0, smoothstep(0.0, 0.2, ndl), bias.w));
+		vis = 1.0 - (1.0 - lit) * sf;
+	}
+
+	// --- ambient occlusion: screen-space disk, occluders weighted by the cosine to the normal ---
+	float ao = 1.0;
+	float af = 1.0 - saturate((dist - fade.z) * fade.w);
+	if (af > 0.001) {
+		float2 gp = to_game(px);
+		float rg = min(aoc.x * abs(proj.y) / d, aoc.z);
+		float2 cell = fmod(vpos, 2.0);
+		float k0 = cell.x * 2.0 + cell.y;
+		float occ = 0.0;
+		[unroll] for (int k = 0; k < 12; ++k) {
+			float a = k * 2.39996 + k0 * 1.5708 + 0.4;
+			float r = sqrt((k + 0.25 + 0.5 * frac(k0 * 0.25 + 0.125)) / 12.0);
+			float2 g = gp + float2(cos(a), sin(a)) * (r * rg);
+			float sd = tex2Dlod(tex0, float4(to_rt_uv(g), 0.0, 0.0)).r;
+			float3 v = sd * view_dir(g) - P;
+			float vv = dot(v, v);
+			float o = saturate(dot(v, N) * rsqrt(vv + 1e-4) - aoc.w) * saturate(1.0 - vv / (4.0 * aoc.x * aoc.x));
+			occ += sd > 0.0 ? o : 0.0;
+		}
+		ao = 1.0 - aoc.y * af * saturate(occ / 12.0 * 2.0);
+	}
+	return float4(ao, vis, d, 1.0);
+}
+
+float4 ps_apply(float2 vpos : VPOS) : COLOR
+{
+	float2 px = vpos + 0.5;
+	float d = depth_at(px);
+	if (d <= 0.0)
+		return float4(1.0, 1.0, 1.0, 1.0);
+	// half-res texel h holds full-res pixel 2h: depth-aware tent over 4x4 texels
+	float2 hc = (px - 0.5) * 0.5;
+	float2 b0 = floor(hc), f = hc - b0;
+	float3 acc = 0.0;
+	[unroll] for (int j = -1; j <= 2; ++j) {
+		float wy = j == -1 ? 1.0 - f.y : (j == 2 ? f.y : 1.0);
+		[unroll] for (int i = -1; i <= 2; ++i) {
+			float wx = i == -1 ? 1.0 - f.x : (i == 2 ? f.x : 1.0);
+			float3 s = tex2Dlod(halfTex, float4((b0 + float2(i, j) + 0.5) * rt.zw, 0.0, 0.0)).rgb;
+			float rel = abs(s.b - d) / d * 50.0;
+			float w = (wx * wy + 1e-3) / (1.0 + rel * rel);
+			acc += float3(s.rg, 1.0) * w;
+		}
+	}
+	float2 av = acc.z > 1e-3 ? acc.xy / acc.z : float2(1.0, 1.0);
+	float3 c = lerp(col.rgb, 1.0, av.y) * av.x;
+	return float4(col.w > 0.5 ? dot(c, float3(0.299, 0.587, 0.114)).xxx : c, 1.0);
+}
+)";
+
+static bool init_shadow_resources()
+{
+	if (s_sh_ps_apply || s_sh_init_failed)
+		return s_sh_ps_apply != nullptr;
+	s_sh_init_failed = true;
+	HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
+	auto compile = dc ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(dc, "D3DCompile")) : nullptr;
+	if (!compile)
+		return false;
+	ID3DBlob *blobs[5] = {};
+	const char *const entries[5][2] = {{"vs_map", "vs_3_0"}, {"ps_map", "ps_3_0"}, {"vs_quad", "vs_3_0"}, {"ps_half", "ps_3_0"}, {"ps_apply", "ps_3_0"}};
+	HRESULT hr = S_OK;
+	for (int i = 0; i < 5 && SUCCEEDED(hr); ++i) {
+		ID3DBlob *err = nullptr;
+		hr = compile(s_sh_src, sizeof(s_sh_src) - 1, "mm7fx_shadows", nullptr, nullptr, entries[i][0], entries[i][1], 0, 0, &blobs[i], &err);
+		if (FAILED(hr))
+			log_info("mm7fx: shadows %s compile failed 0x%08lx: %s", entries[i][0], hr, err ? static_cast<const char *>(err->GetBufferPointer()) : "?");
+		if (err) err->Release();
+	}
+	auto code = [&](int i) { return static_cast<const DWORD *>(blobs[i]->GetBufferPointer()); };
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexShader(code(0), &s_sh_vs_map);
+	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(code(1), &s_sh_ps_map);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexShader(code(2), &s_sh_vs_quad);
+	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(code(3), &s_sh_ps_half);
+	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(code(4), &s_sh_ps_apply);
+	for (ID3DBlob *b : blobs)
+		if (b) b->Release();
+	if (SUCCEEDED(hr)) hr = s_dev->CreateStateBlock(D3DSBT_ALL, &s_sh_state);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateTexture(shcfg::MapSize, shcfg::MapSize, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &s_sh_map, nullptr);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateDepthStencilSurface(shcfg::MapSize, shcfg::MapSize, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, TRUE, &s_sh_map_ds, nullptr);
+	if (FAILED(hr)) {
+		log_info("mm7fx: shadows init failed 0x%08lx, shadows disabled", hr);
+		if (s_sh_ps_apply) s_sh_ps_apply->Release();
+		s_sh_ps_apply = nullptr; // the readiness flag
+		return false;
+	}
+	s_sh_init_failed = false;
+	log_info("mm7fx: shadows ready (map %d)", shcfg::MapSize);
+	return true;
+}
+
+static void shadows_release_resources()
+{
+	for (IUnknown **p : {reinterpret_cast<IUnknown **>(&s_sh_map), reinterpret_cast<IUnknown **>(&s_sh_half),
+	                     reinterpret_cast<IUnknown **>(&s_sh_map_ds), reinterpret_cast<IUnknown **>(&s_sh_vs_map),
+	                     reinterpret_cast<IUnknown **>(&s_sh_vs_quad), reinterpret_cast<IUnknown **>(&s_sh_ps_map),
+	                     reinterpret_cast<IUnknown **>(&s_sh_ps_half), reinterpret_cast<IUnknown **>(&s_sh_ps_apply),
+	                     reinterpret_cast<IUnknown **>(&s_sh_state)}) {
+		if (*p) (*p)->Release();
+		*p = nullptr;
+	}
+}
+
+// From fog_render, inside its BeginScene, with s_fog_depth_tex holding this frame's linear depth.
+// sun: world direction to the sun (fog's time-of-day model). Restores targets and state.
+static void shadows_render(const float sun[3])
+{
+	if (!shadows_wanted() || !s_fog_depth_tex || !s_fog_decl || !init_shadow_resources())
+		return;
+	D3DSURFACE_DESC rd, hd = {};
+	s_fog_rt->GetDesc(&rd);
+	const UINT hw = (rd.Width + 1) / 2, hh = (rd.Height + 1) / 2;
+	if (s_sh_half)
+		s_sh_half->GetLevelDesc(0, &hd);
+	if (!s_sh_half || hd.Width != hw || hd.Height != hh) {
+		if (s_sh_half) s_sh_half->Release();
+		s_sh_half = nullptr;
+		if (FAILED(s_dev->CreateTexture(hw, hh, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &s_sh_half, nullptr))) {
+			log_info("mm7fx: shadows half-res target %ux%u failed, shadows disabled", hw, hh);
+			s_sh_init_failed = true;
+			shadows_release_resources();
+			return;
+		}
+	}
+
+	// light basis in world space: ls toward the sun, lx horizontal, ly = ls x lx
+	const double ls[3] = {sun[0], sun[1], sun[2]};
+	const double hl = std::sqrt(ls[0] * ls[0] + ls[1] * ls[1]);
+	const double lx[3] = {hl > 1e-6 ? -ls[1] / hl : 1, hl > 1e-6 ? ls[0] / hl : 0, 0};
+	const double ly[3] = {ls[1] * lx[2] - ls[2] * lx[1], ls[2] * lx[0] - ls[0] * lx[2], ls[0] * lx[1] - ls[1] * lx[0]};
+	const float *r[3] = {s_fog_rx, s_fog_ry, s_fog_rz}; // view images of world X, Y, Z: world_k = cam_k + dot(r[k], view)
+	// map centre ahead of the camera, snapped to whole texels across the map (no shimmering while moving)
+	double fw[2] = {r[0][0], r[1][0]};
+	const double fl = std::sqrt(fw[0] * fw[0] + fw[1] * fw[1]);
+	const double ahead = fl > 1e-3 ? shcfg::Ahead / fl : 0;
+	const double c[3] = {s_fog_cam[0] + fw[0] * ahead, s_fog_cam[1] + fw[1] * ahead, s_fog_cam[2]};
+	const double texel = double(shcfg::Extent) / shcfg::MapSize;
+	auto dot3 = [](const double *a, const double *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+	const double cam[3] = {s_fog_cam[0], s_fog_cam[1], s_fog_cam[2]};
+	const double origin[3] = {std::floor(dot3(lx, c) / texel) * texel, std::floor(dot3(ly, c) / texel) * texel, dot3(ls, c)};
+	float rows[12];
+	const double *axes[3] = {lx, ly, ls};
+	for (int a = 0; a < 3; ++a) {
+		for (int k = 0; k < 3; ++k)
+			rows[a * 4 + k] = float(axes[a][0] * r[0][k] + axes[a][1] * r[1][k] + axes[a][2] * r[2][k]);
+		rows[a * 4 + 3] = float(dot3(axes[a], cam) - origin[a]);
+	}
+	const float sunv[3] = {rows[8], rows[9], rows[10]}; // view-space direction to the sun
+	const float sun_f = shcfg::Strength * smooth01(shcfg::SunLow, shcfg::SunHigh, sun[2]);
+
+	// billboards turned to face the sun about the world vertical through their centre (a camera-facing card seen from
+	// the side casts a sliver), then pushed away from the sun: same shadow on the ground, but the card's own pixels
+	// (camera-facing) are no longer behind it
+	s_sh_bb.clear();
+	if (sun_f > 0) {
+		const float *up = s_fog_rz;
+		float h[3] = {-up[0] * up[1], 1 - up[1] * up[1], -up[2] * up[1]}; // camera left, horizontal
+		float sh[3] = {sunv[0], sunv[1], sunv[2]};
+		const float su = sh[0] * up[0] + sh[1] * up[1] + sh[2] * up[2];
+		for (int k = 0; k < 3; ++k) sh[k] -= su * up[k];
+		float side[3] = {up[1] * sh[2] - up[2] * sh[1], up[2] * sh[0] - up[0] * sh[2], up[0] * sh[1] - up[1] * sh[0]};
+		const float hlen = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+		const float slen = std::sqrt(side[0] * side[0] + side[1] * side[1] + side[2] * side[2]);
+		if (hlen > 1e-3f && slen > 1e-3f) {
+			const float sg = (side[0] * h[0] + side[1] * h[1] + side[2] * h[2]) < 0 ? -1.0f : 1.0f;
+			for (int k = 0; k < 3; ++k) { h[k] /= hlen; side[k] *= sg / slen; }
+			s_sh_bb = s_bb_verts;
+			for (const auto &p : s_bb_polys) {
+				MirrorVertex *v = &s_sh_bb[p.first];
+				float ctr[3] = {};
+				for (uint32_t i = 0; i < p.count; ++i) { ctr[0] += v[i].x / p.count; ctr[1] += v[i].y / p.count; ctr[2] += v[i].z / p.count; }
+				float st[4][2], half_w = 0;
+				for (uint32_t i = 0; i < p.count; ++i) {
+					const float d[3] = {v[i].x - ctr[0], v[i].y - ctr[1], v[i].z - ctr[2]};
+					st[i][0] = d[0] * h[0] + d[1] * h[1] + d[2] * h[2];
+					st[i][1] = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
+					half_w = std::max(half_w, std::fabs(st[i][0]));
+				}
+				const float push = shcfg::BillboardPush * half_w;
+				for (uint32_t i = 0; i < p.count; ++i) {
+					v[i].x = ctr[0] + side[0] * st[i][0] + up[0] * st[i][1] - sunv[0] * push;
+					v[i].y = ctr[1] + side[1] * st[i][0] + up[1] * st[i][1] - sunv[1] * push;
+					v[i].z = ctr[2] + side[2] * st[i][0] + up[2] * st[i][1] - sunv[2] * push;
+				}
+			}
+		}
+	}
+
+	const int32_t *rr = reinterpret_cast<const int32_t *>(mm7::RenderRect);
+	const float k[16 * 4] = {
+		s_fog_proj[0], s_fog_proj[1], s_fog_proj[2], s_fog_proj[3],
+		s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1],
+		s_fog_dxw[0], s_fog_dxw[1], s_fog_dxw[2], s_fog_dxw[3],
+		s_fog_dxw[4], s_fog_dxw[5], s_fog_dxw[6], s_fog_dxw[7],
+		1.0f / rd.Width, 1.0f / rd.Height, 1.0f / hw, 1.0f / hh,
+		float(s_fog_vp.X), float(s_fog_vp.Y), float(s_fog_vp.Width), float(s_fog_vp.Height),
+		rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7], rows[8], rows[9], rows[10], rows[11],
+		sunv[0], sunv[1], sunv[2], sun_f,
+		2.0f / shcfg::Extent, 0.5f / shcfg::DepthRange, float(shcfg::MapSize), float(texel),
+		shcfg::Bias, shcfg::SlopeBias, shcfg::NormalOffset, shcfg::BackfaceShade,
+		shcfg::FadeStart, 1.0f / (shcfg::FadeEnd - shcfg::FadeStart), shcfg::AoFadeStart, 1.0f / (shcfg::AoFadeEnd - shcfg::AoFadeStart),
+		shcfg::AoRadius, shcfg::AoStrength, shcfg::AoMaxPx, shcfg::AoCosBias,
+		shcfg::ShadowColor[0], shcfg::ShadowColor[1], shcfg::ShadowColor[2], shadows_debug() ? 1.0f : 0.0f,
+		0, 0, 0, 0}; // atest
+
+	s_sh_state->Capture();
+	IDirect3DSurface9 *prev_rt = nullptr, *prev_ds = nullptr, *surf = nullptr;
+	s_dev->GetRenderTarget(0, &prev_rt);
+	s_dev->GetDepthStencilSurface(&prev_ds);
+	s_dev->SetVertexShaderConstantF(0, k, 16);
+	s_dev->SetPixelShaderConstantF(0, k, 16);
+	s_dev->SetVertexDeclaration(s_fog_decl); // MirrorVertex
+	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+	s_dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	s_dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_DEPTHBIAS, 0);
+	s_dev->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
+	for (DWORD s = 0; s < 3; ++s) {
+		s_dev->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
+		s_dev->SetSamplerState(s, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+		s_dev->SetSamplerState(s, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+		s_dev->SetSamplerState(s, D3DSAMP_MINFILTER, s == 0 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
+		s_dev->SetSamplerState(s, D3DSAMP_MAGFILTER, s == 0 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
+		s_dev->SetSamplerState(s, D3DSAMP_MIPFILTER, s == 0 ? D3DTEXF_LINEAR : D3DTEXF_NONE); // billboard alpha: mips
+	}
+
+	// 1. shadow map
+	s_sh_map->GetSurfaceLevel(0, &surf);
+	s_dev->SetRenderTarget(0, surf);
+	surf->Release();
+	s_dev->SetDepthStencilSurface(s_sh_map_ds);
+	const D3DVIEWPORT9 mvp = {0, 0, DWORD(shcfg::MapSize), DWORD(shcfg::MapSize), 0.0f, 1.0f};
+	s_dev->SetViewport(&mvp);
+	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFFFFFFFF, 1.0f, 0); // r = 1: no caster
+	if (sun_f > 0) {
+		s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+		s_dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+		s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+		s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+		s_dev->SetVertexShader(s_sh_vs_map);
+		s_dev->SetPixelShader(s_sh_ps_map);
+		s_dev->SetTexture(0, nullptr);
+		constexpr size_t chunk = 3 * 20000;
+		for (size_t i = 0; i < s_fog_tris.size(); i += chunk)
+			s_dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, static_cast<UINT>(std::min(chunk, s_fog_tris.size() - i) / 3), &s_fog_tris[i], sizeof(MirrorVertex));
+		if (!s_sh_bb.empty()) {
+			const float at[4] = {1, 0, 0, 0};
+			s_dev->SetPixelShaderConstantF(15, at, 1);
+			for (const auto &p : s_bb_polys) { // ponytail: one draw per billboard, like the fog's depth pass
+				s_dev->SetTexture(0, p.tex);
+				s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_sh_bb[p.first], sizeof(MirrorVertex));
+			}
+		}
+	}
+
+	// 2. half resolution: AO + sun visibility + depth
+	s_sh_half->GetSurfaceLevel(0, &surf);
+	s_dev->SetRenderTarget(0, surf);
+	surf->Release();
+	s_dev->SetDepthStencilSurface(nullptr);
+	const D3DVIEWPORT9 hvp = {s_fog_vp.X / 2, s_fog_vp.Y / 2, std::min<DWORD>((s_fog_vp.Width + 1) / 2, hw - s_fog_vp.X / 2),
+	                          std::min<DWORD>((s_fog_vp.Height + 1) / 2, hh - s_fog_vp.Y / 2), 0.0f, 1.0f};
+	s_dev->SetViewport(&hvp);
+	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0x00FFFF00, 1.0f, 0); // AO 1, visible, depth 0
+	s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+	s_dev->SetVertexShader(s_sh_vs_quad);
+	s_dev->SetPixelShader(s_sh_ps_half);
+	s_dev->SetTexture(0, s_fog_depth_tex);
+	s_dev->SetTexture(1, s_sh_map);
+	s_dev->SetTexture(2, nullptr);
+	s_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+	s_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+	s_dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	const float l = float(rr[0]), tp = float(rr[1]), rt = float(rr[2]), b = float(rr[3]);
+	const MirrorVertex quad[4] = {{l, tp, 0, 0, 0, 0}, {rt, tp, 0, 0, 0, 0}, {rt, b, 0, 0, 0, 0}, {l, b, 0, 0, 0, 0}};
+	s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(MirrorVertex));
+
+	// 3. multiply into the game's 3D view (debug: replace)
+	s_dev->SetRenderTarget(0, s_fog_rt);
+	s_dev->SetViewport(&s_fog_vp);
+	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, shadows_debug() ? FALSE : TRUE);
+	s_dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+	s_dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_DESTCOLOR);
+	s_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+	s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x7);
+	s_dev->SetPixelShader(s_sh_ps_apply);
+	s_dev->SetTexture(1, nullptr);
+	s_dev->SetTexture(2, s_sh_half);
+	s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(MirrorVertex));
+
+	s_dev->SetRenderTarget(0, prev_rt);
+	s_dev->SetDepthStencilSurface(prev_ds);
+	s_sh_state->Apply(); // after the targets: SetRenderTarget resets the viewport
+	if (prev_rt) prev_rt->Release();
+	if (prev_ds) prev_ds->Release();
+	static DWORD last = 0;
+	if (GetTickCount() - last > 5000) {
+		last = GetTickCount();
+		log_info("mm7fx dbg: shadows %zu tris %zu billboards, sun (%.2f %.2f %.2f) strength %.2f, centre (%.0f %.0f %.0f), mode %d",
+			s_fog_tris.size() / 3, s_bb_polys.size(), sun[0], sun[1], sun[2], sun_f, c[0], c[1], c[2], s_sh_mode);
 	}
 }
 
@@ -2018,6 +2493,7 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
 			std::fclose(f);
 		}
 		fog_poll_toggle();
+		shadows_poll_toggle();
 	}
 
 	const DWORD now = GetTickCount();
@@ -2046,6 +2522,7 @@ static void on_destroy_device(device *)
 	release_captured();
 	release_mirror_resources();
 	fog_release_resources();
+	shadows_release_resources();
 	if (s_state) s_state->Release();
 	if (s_water_ps) s_water_ps->Release();
 	if (s_wave_tex) s_wave_tex->Release();
