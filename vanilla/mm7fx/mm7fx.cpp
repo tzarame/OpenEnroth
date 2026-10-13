@@ -352,7 +352,10 @@ sampler2D layerTex : register(s1);
 float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
 {
 	float4 t = tex2D(layerTex, uv);
-	return float4(t.rgb * color.rgb, t.a); // vertex alpha is not meaningful for terrain
+	// transparent texels are black: bilinear filtering darkens the edge colour (dark outline along the shore);
+	// undo it by dividing by the filtered alpha
+	float3 c = t.rgb / max(t.a, 1e-3);
+	return float4(saturate(c) * color.rgb, t.a); // vertex alpha is not meaningful for terrain
 }
 )";
 
