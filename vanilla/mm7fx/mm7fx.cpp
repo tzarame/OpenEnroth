@@ -118,20 +118,26 @@ static DWORD s_overlay_src = D3DBLEND_SRCALPHA, s_overlay_dst = D3DBLEND_INVSRCA
 
 // Raw game TL vertex (640x480 screen, z, rhw). Our vertex shader converts it to clip space like dxwrapper's
 // XYZRHW fix-up shader does, so the GPU clips polygons with vertices behind/near the camera correctly.
-struct WaterVertex { float x, y, z, rhw; uint32_t diffuse; float u, v; };
+struct WaterVertex { float x, y, z, rhw; uint32_t diffuse; float u, v; float wx, wy; };
 static const D3DVERTEXELEMENT9 s_water_decl_elems[] = {
 	{0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
 	{0, 16, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
 	{0, 20, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
+	{0, 28, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 1},
 	D3DDECL_END()};
 // Shore tiles are drawn by vanilla in two layers: water first, then the shore texture alpha-blended on top.
 // tex = water layer, overlay = shore layer (null for pure water).
-struct WaterPoly { IDirect3DBaseTexture9 *tex; uint32_t first, count; bool shore; IDirect3DBaseTexture9 *overlay; };
+struct WaterPoly { IDirect3DBaseTexture9 *tex; uint32_t first, count; bool shore; IDirect3DBaseTexture9 *overlay; float z; };
 static std::vector<WaterVertex> s_water_verts;
 static std::vector<WaterPoly> s_water_polys;
 
 // horizon fit: screen y = a + b * (v_vert / v_fwd); camera "up" from world-axis deltas of tile corners
 struct Fit { double n = 0, st = 0, sy = 0, stt = 0, sty = 0; float up[3] = {}; bool have_up = false; };
+// Camera basis in view space (images of world X, Y, Z axes) + camera world position, from flat water tiles;
+// kept across frames so every water vertex can be given world coordinates (world-anchored waves).
+static float s_bx[3], s_by[3], s_bz[3], s_cam[3], s_water_z = 0;
+static bool s_basis_ok = false;
+static uint32_t s_fit_vertex = 0;
 static Fit s_fit;
 static D3DVIEWPORT9 s_game_vp = {}; // D3D9 viewport the game's water was drawn with
 static IDirect3DSurface9 *s_game_rt = nullptr; // render target the game's water was drawn into (AddRef'd)
@@ -239,7 +245,9 @@ static void capture_water_poly()
 	// second call of a shore tile (alpha-blended shore layer): kept as an overlay-only poly, drawn after all water;
 	// the shore tile's water layer (first call) is then plain water
 	const bool layer = s_poly_overlay && !s_poly_tex;
-	WaterPoly wp = {s_poly_tex, static_cast<uint32_t>(s_water_verts.size()), n, shore && !layer && false, s_poly_overlay};
+	float pz = 0;
+	for (uint32_t i = 0; i < n; ++i) pz += sv[i].wz;
+	WaterPoly wp = {s_poly_tex, static_cast<uint32_t>(s_water_verts.size()), n, shore && !layer && false, s_poly_overlay, pz / n};
 	s_poly_tex = nullptr; // references move to the poly
 	s_poly_overlay = nullptr;
 	for (uint32_t i = 0; i < n; ++i) {
@@ -247,7 +255,13 @@ static void capture_water_poly()
 		s_zmin = t.z < s_zmin ? t.z : s_zmin; s_zmax = t.z > s_zmax ? t.z : s_zmax;
 		s_rmin = t.rhw < s_rmin ? t.rhw : s_rmin; s_rmax = t.rhw > s_rmax ? t.rhw : s_rmax;
 		// -0.5: D3D9 rasterizes pixel centers at integer coords, D3D7 TL vertices at +0.5
-		s_water_verts.push_back({t.x, t.y, t.z, t.rhw, t.diffuse, t.u, t.v});
+		float wx = 0, wy = 0;
+		if (s_basis_ok) { // world = camera + basis^T * view
+			const float v[3] = {sv[i].vx, sv[i].vy, sv[i].vz};
+			wx = s_cam[0] + v[0] * s_bx[0] + v[1] * s_bx[1] + v[2] * s_bx[2];
+			wy = s_cam[1] + v[0] * s_by[0] + v[1] * s_by[1] + v[2] * s_by[2];
+		}
+		s_water_verts.push_back({t.x, t.y, t.z, t.rhw, t.diffuse, t.u, t.v, wx, wy});
 	}
 	s_water_polys.push_back(wp);
 	static DWORD last = 0;
@@ -280,7 +294,7 @@ static void capture_water_poly()
 				const float dv[3] = {sv[j].vx - sv[i].vx, sv[j].vy - sv[i].vy, sv[j].vz - sv[i].vz};
 				// near-clipped vertices keep stale world positions: the view delta must be as long as the world delta
 				const float dvl = std::sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
-				if (!gx && std::fabs(dwx) > 100 && std::fabs(dwy) < 1 && std::fabs(dvl - std::fabs(dwx)) < 0.01f * std::fabs(dwx)) { for (int k = 0; k < 3; ++k) rx[k] = dv[k] / dwx; gx = true; }
+				if (!gx && std::fabs(dwx) > 100 && std::fabs(dwy) < 1 && std::fabs(dvl - std::fabs(dwx)) < 0.01f * std::fabs(dwx)) { for (int k = 0; k < 3; ++k) rx[k] = dv[k] / dwx; gx = true; s_fit_vertex = i; }
 				if (!gy && std::fabs(dwy) > 100 && std::fabs(dwx) < 1 && std::fabs(dvl - std::fabs(dwy)) < 0.01f * std::fabs(dwy)) { for (int k = 0; k < 3; ++k) ry[k] = dv[k] / dwy; gy = true; }
 			}
 		if (gx && gy) {
@@ -288,6 +302,18 @@ static void capture_water_poly()
 			s_fit.up[1] = rx[2] * ry[0] - rx[0] * ry[2];
 			s_fit.up[2] = rx[0] * ry[1] - rx[1] * ry[0];
 			s_fit.have_up = true;
+			// camera world position from a vertex whose world coords are trustworthy (unclipped: |view| == |world| deltas)
+			const float ul = std::sqrt(s_fit.up[0] * s_fit.up[0] + s_fit.up[1] * s_fit.up[1] + s_fit.up[2] * s_fit.up[2]);
+			if (ul > 1e-6f) {
+				for (int k = 0; k < 3; ++k) { s_bx[k] = rx[k]; s_by[k] = ry[k]; s_bz[k] = s_fit.up[k] / ul; }
+				const auto &q = sv[s_fit_vertex];
+				const float v[3] = {q.vx, q.vy, q.vz};
+				s_cam[0] = q.wx - (v[0] * s_bx[0] + v[1] * s_bx[1] + v[2] * s_bx[2]);
+				s_cam[1] = q.wy - (v[0] * s_by[0] + v[1] * s_by[1] + v[2] * s_by[2]);
+				s_cam[2] = q.wz - (v[0] * s_bz[0] + v[1] * s_bz[1] + v[2] * s_bz[2]);
+				s_water_z = q.wz;
+				s_basis_ok = true;
+			}
 		}
 	}
 }
@@ -312,8 +338,8 @@ static void solve_horizon()
 // ---- water pass ------------------------------------------------------------------------------
 
 static const char s_water_vs_src[] = R"(
-struct VSIn { float4 pos : POSITION; float4 color : COLOR0; float2 uv : TEXCOORD0; };
-struct VSOut { float4 pos : POSITION; float4 color : COLOR0; float2 uv : TEXCOORD0; };
+struct VSIn { float4 pos : POSITION; float4 color : COLOR0; float2 uv : TEXCOORD0; float2 world : TEXCOORD1; };
+struct VSOut { float4 pos : POSITION; float4 color : COLOR0; float2 uv : TEXCOORD0; float2 world : TEXCOORD1; };
 float4 offset : register(c0);     // dxwrapper's fix-up constants, captured at the vanilla water draw
 float4 multiplier : register(c1);
 float4 gf : register(c2);         // GrayFace HD scaling: xy * gf.xy + gf.zw
@@ -331,6 +357,7 @@ VSOut main(VSIn i)
 	o.pos.w = w;
 	o.color = i.color;
 	o.uv = i.uv;
+	o.world = i.world;
 	return o;
 }
 )";
@@ -351,6 +378,8 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
 static const char s_water_ps_src[] = R"(
 sampler2D sceneTex : register(s0);
 sampler2D waterTex : register(s1);
+sampler2D mirrorTex : register(s2);
+sampler2D waveTex : register(s3);   // tileable wave normal map (xy in rg)
 float4 params : register(c0); // x = time (s), y = fit a (px), z = fit b (px), w = T = tan(2 * horizon angle)
 float4 extra : register(c1);  // x = reflection strength, y = horizon (game px), z = 1/480, w = debug solid
 float4 rt : register(c2);     // x = 1/RT width, y = 1/RT height
@@ -361,7 +390,9 @@ float4 gf : register(c6);     // GrayFace HD scaling: xy * gf.xy + gf.zw
 float4 mir : register(c7);    // x = planar mirror in mirrorTex (sceneTex = sky only), y = debug: reflection only
 float4 shore : register(c8);  // x = 1: single-layer shore tile, effect masked to water-coloured texels
 float4 view : register(c9);   // game 3D view rect (game screen coords): left, top, right, bottom
-sampler2D mirrorTex : register(s2);
+float4 cam : register(c10);   // camera world position xyz, w = 1 if world coords are valid
+float4 sun : register(c11);   // world direction to the sun xyz, w = sun intensity (0 at night)
+float4 wat : register(c12);   // x = water surface world z, y = wave strength, z = sun specular power
 // "looks like water": blue clearly above red (sand/grass/dirt have b < r) and not grey (rock, foam)
 static const float2 BlueMinusRed = float2(0.04, 0.12); // smoothstep edges of b - r
 static const float2 Saturation = float2(0.10, 0.22);   // smoothstep edges of (max - min) / max
@@ -381,45 +412,65 @@ float2 to_rt_uv(float2 g)     // game TL screen coords -> RT uv
 	float2 ndc = (g * gf.xy + gf.zw + off.xy) * mul.xy;
 	return float2(vp.x + (ndc.x + 1.0) * 0.5 * vp.z, vp.y + (1.0 - ndc.y) * 0.5 * vp.w) * rt.xy;
 }
-float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR
+float2 wave(float2 p, float2 dir, float speed, float scale, float time)
 {
-	float2 gp = to_game(vpos + 0.5);
-	float2 suv = gp * extra.z;                         // ~0..1 scale for ripple frequencies
+	return tex2D(waveTex, p / scale + dir * time * speed).rg * 2.0 - 1.0;
+}
+float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 world : TEXCOORD1, float2 vpos : VPOS) : COLOR
+{
 	float time = params.x;
-	// ripples follow the waves painted in the water texture: its brightness is used as a height map and the
-	// screen-space gradient bends the reflection along the wave crests (the texture itself is animated by the game)
-	float hgt = dot(tex2D(waterTex, uv).rgb, float3(0.299, 0.587, 0.114));
-	float2 rip = float2(ddx(hgt), ddy(hgt)) * 0.06 + float2(sin(time * 0.7 + suv.y * 40.0), 0.0) * 0.0006;
+	float2 gp = to_game(vpos + 0.5);
 	float y = gp.y;                                    // game screen px
+
+	// --- waves: three world-anchored layers of the normal map, detail fades with distance ---
+	float3 P = float3(world, wat.x);
+	float3 toCam = cam.xyz - P;
+	float dist = length(toCam);
+	float3 V = toCam / max(dist, 1.0);
+	float detail = saturate(1.0 - dist / 7000.0);
+	float2 nxy = wave(world, float2(0.71, 0.70), 0.020, 1300.0, time) * 0.55
+	           + wave(world, float2(-0.86, 0.50), 0.011, 3100.0, time) * 0.45
+	           + wave(world, float2(0.20, -0.98), 0.045, 430.0, time) * 0.35 * detail;
+	nxy *= wat.y * cam.w;
+	float3 N = normalize(float3(nxy, 1.0));
+
+	// --- reflection (planar mirror, angular sky fallback), distorted by the wave normals ---
+	float2 rip = nxy * 0.03 * saturate(1800.0 / dist);
 	float t = (y - params.y) / params.z;               // tan of the view-space vertical angle
 	float tr = (params.w - t) / (1.0 + params.w * t);  // mirrored about the horizon angle
 	float yr = params.y + params.z * tr;               // reflected point, game px
-	float below = max(y - extra.y, 0.0) * extra.z;
-	float2 ruv = to_rt_uv(float2(gp.x, yr)) + rip * (1.0 + below * 6.0);
+	float2 ruv = to_rt_uv(float2(gp.x, yr)) + rip;
 	// valid image = the game's 3D view; the render target around it is not drawn (black)
 	float2 vlo = to_rt_uv(view.xy), vhi = to_rt_uv(view.zw);
 	float2 lo = min(vlo, vhi), hi = max(vlo, vhi) - rt.xy;
-	float top = lo.y;
-	float inside = saturate((ruv.y - top) * 8.0);      // reflected ray left the top of the view: no data
-	ruv = clamp(ruv, lo, hi);
-	float3 refl = tex2D(sceneTex, ruv).rgb;
-	// planar mirror: mirrored geometry rendered for this very pixel (alpha = coverage), the sky behind it is
-	// exact under the angular mirror, so clamping at the top only stretches the zenith sky
-	float4 mr = tex2D(mirrorTex, clamp((vpos + 0.5) * rt.xy + rip * (1.0 + below * 6.0), lo, hi));
+	float inside = saturate((ruv.y - lo.y) * 8.0);     // reflected ray left the top of the view: no data
+	float3 refl = tex2D(sceneTex, clamp(ruv, lo, hi)).rgb;
+	float4 mr = tex2D(mirrorTex, clamp((vpos + 0.5) * rt.xy + rip, lo, hi));
 	refl = lerp(refl, mr.rgb, mr.a * mir.x);
 	inside = lerp(inside, 1.0, mir.x);
 	if (mir.y > 0.5)
 		return float4(refl, 1.0);
+
+	// --- water body: the game's water texture deepened towards a dark blue-green ---
 	float m = shore.x > 0.5 ? water_mask(tex2D(waterTex, uv).rgb) : 1.0;
-	float3 base = tex2D(waterTex, uv + rip * 4.0 * m).rgb * color.rgb; // m = 0: exactly the base texture
-	float fresnel = saturate(1.0 - below * 3.5);
-	float k = extra.x * (0.35 + 0.55 * fresnel) * inside * m;
-	// harmonise the reflection with the water texture: take its hue from the water colour at this texel and let
-	// the texture's light/dark wave pattern modulate the reflection's brightness
-	float lb = dot(base, float3(0.299, 0.587, 0.114));
-	float3 tint = base / max(lb, 0.05);
-	float3 wrefl = refl * lerp(float3(1.0, 1.0, 1.0), tint, 0.45) * (0.65 + 0.9 * lb);
-	float3 c = lerp(base, wrefl, k);
+	float3 tex = tex2D(waterTex, uv + rip * 3.0 * m).rgb * color.rgb;
+	float3 deep = float3(0.035, 0.11, 0.16) * (0.4 + 0.6 * sun.w);
+	float3 body = lerp(deep, tex, 0.55);
+
+	// --- Fresnel (Schlick, water F0 = 0.02): looking down you see the water, at grazing angles the sky ---
+	float NdV = saturate(dot(N, V));
+	float fres = 0.02 + 0.98 * pow(1.0 - NdV, 5.0);
+	float k = saturate(fres * extra.x * 1.6) * inside * m;
+	float lb = dot(tex, float3(0.299, 0.587, 0.114));
+	float3 tint = tex / max(lb, 0.05);
+	float3 wrefl = refl * lerp(float3(1.0, 1.0, 1.0), tint, 0.3);
+	float3 c = lerp(body, wrefl, k);
+
+	// --- sun glints ---
+	float3 R = reflect(-V, N);
+	float spec = pow(saturate(dot(R, sun.xyz)), wat.z) * sun.w * m * cam.w;
+	c += spec * float3(1.0, 0.92, 0.78) * 2.5;
+
 	float3 dbg = shore.x > 0.5 ? float3(0.0, 1.0, 1.0) : float3(1.0, 0.0, 1.0);
 	return float4(lerp(c, dbg, extra.w), 1.0); // extra.w = 1: debug solid magenta (water) / cyan (shore)
 }
@@ -427,12 +478,75 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : 
 
 static IDirect3DPixelShader9 *s_water_ps = nullptr;
 static IDirect3DPixelShader9 *s_overlay_ps = nullptr;
+static IDirect3DTexture9 *s_wave_tex = nullptr; // procedural tileable wave normal map
 static IDirect3DVertexShader9 *s_water_vs = nullptr;
 static IDirect3DVertexDeclaration9 *s_water_decl = nullptr;
 static IDirect3DTexture9 *s_scene_tex = nullptr;
 static UINT s_scene_w = 0, s_scene_h = 0;
 static IDirect3DStateBlock9 *s_state = nullptr;
 static bool s_init_failed = false;
+
+// Tileable wave normal map: sum of sines with integer wave vectors (so it wraps), amplitudes falling with frequency.
+static bool create_wave_texture()
+{
+	constexpr int S = 256;
+	if (FAILED(s_dev->CreateTexture(S, S, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &s_wave_tex, nullptr)))
+		return false;
+	struct W { int kx, ky; float a, ph; };
+	W w[40];
+	uint32_t seed = 0x9E3779B9u;
+	auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0f; };
+	for (auto &x : w) {
+		const float ang = rnd() * 6.2831853f, f = 1.0f + rnd() * rnd() * 9.0f;
+		x.kx = static_cast<int>(std::lround(std::cos(ang) * f));
+		x.ky = static_cast<int>(std::lround(std::sin(ang) * f));
+		if (!x.kx && !x.ky) x.kx = 1;
+		x.a = 1.0f / (0.6f + std::sqrt(float(x.kx * x.kx + x.ky * x.ky)));
+		x.ph = rnd() * 6.2831853f;
+	}
+	std::vector<float> h(S * S);
+	for (int y = 0; y < S; ++y)
+		for (int x = 0; x < S; ++x) {
+			float v = 0;
+			for (const auto &q : w)
+				v += q.a * std::sin(6.2831853f * (q.kx * x + q.ky * y) / S + q.ph);
+			h[y * S + x] = v;
+		}
+	std::vector<uint32_t> lvl(S * S);
+	for (int y = 0; y < S; ++y)
+		for (int x = 0; x < S; ++x) {
+			const float dx = h[y * S + (x + 1) % S] - h[y * S + (x + S - 1) % S];
+			const float dy = h[((y + 1) % S) * S + x] - h[((y + S - 1) % S) * S + x];
+			float nx = -dx * 0.9f, ny = -dy * 0.9f, nz = 1.0f;
+			const float l = std::sqrt(nx * nx + ny * ny + nz * nz);
+			nx /= l; ny /= l;
+			const auto enc = [](float c) { return static_cast<uint32_t>(std::lround((c * 0.5f + 0.5f) * 255.0f)); };
+			lvl[y * S + x] = 0xFF000000u | (enc(nx) << 16) | (enc(ny) << 8) | enc(nz / l);
+		}
+	// upload level 0 and box-filtered mips
+	for (DWORD level = 0, size = S; level < s_wave_tex->GetLevelCount(); ++level, size = size > 1 ? size / 2 : 1) {
+		D3DLOCKED_RECT lr;
+		if (FAILED(s_wave_tex->LockRect(level, &lr, nullptr, 0)))
+			return false;
+		for (DWORD y = 0; y < size; ++y)
+			std::memcpy(static_cast<uint8_t *>(lr.pBits) + y * lr.Pitch, &lvl[y * size], size * 4);
+		s_wave_tex->UnlockRect(level);
+		if (size == 1)
+			break;
+		std::vector<uint32_t> next((size / 2) * (size / 2));
+		for (DWORD y = 0; y < size / 2; ++y)
+			for (DWORD x = 0; x < size / 2; ++x) {
+				uint32_t acc[4] = {};
+				for (int k = 0; k < 4; ++k) {
+					const uint32_t c = lvl[(2 * y + k / 2) * size + 2 * x + k % 2];
+					for (int ch = 0; ch < 4; ++ch) acc[ch] += (c >> (8 * ch)) & 0xFF;
+				}
+				next[y * (size / 2) + x] = (acc[0] / 4) | ((acc[1] / 4) << 8) | ((acc[2] / 4) << 16) | ((acc[3] / 4) << 24);
+			}
+		lvl.swap(next);
+	}
+	return true;
+}
 
 static bool init_water_resources()
 {
@@ -465,6 +579,7 @@ static bool init_water_resources()
 	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(static_cast<const DWORD *>(ps->GetBufferPointer()), &s_water_ps);
 	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(static_cast<const DWORD *>(ops->GetBufferPointer()), &s_overlay_ps);
 	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexDeclaration(s_water_decl_elems, &s_water_decl);
+	if (SUCCEEDED(hr) && !create_wave_texture()) hr = E_FAIL;
 	if (SUCCEEDED(hr)) hr = s_dev->CreateStateBlock(D3DSBT_ALL, &s_state);
 	vs->Release();
 	ps->Release();
@@ -566,6 +681,11 @@ static IDirect3DBaseTexture9 *s_mir_cur_tex = nullptr; // first non-null texture
 static LinFit s_mir_fit_x, s_mir_fit_y;
 static double s_mir_water_sum[3] = {};             // view-space sum of water vertices -> plane offset
 static uint32_t s_mir_water_cnt = 0;
+// Water can lie at several heights (sea, inland ponds): the mirror plane uses the most common level in view,
+// water at other levels gets the angular (sky) reflection instead.
+struct WaterLevel { float z; double sum[3]; uint32_t n; };
+static std::vector<WaterLevel> s_mir_levels;
+static float s_mirror_level_z = 0;
 static bool s_sky_pending = false, s_sky_ready = false;
 static IDirect3DTexture9 *s_sky_tex = nullptr;     // frame right after the sky pass (sky only)
 static IDirect3DTexture9 *s_mirror_tex = nullptr;  // mirrored geometry, alpha = coverage
@@ -640,6 +760,7 @@ static void mirror_release_captured()
 	s_mir_fit_y = LinFit();
 	s_mir_water_sum[0] = s_mir_water_sum[1] = s_mir_water_sum[2] = 0;
 	s_mir_water_cnt = 0;
+	s_mir_levels.clear();
 	s_sky_ready = false;
 }
 
@@ -711,9 +832,17 @@ static void mirror_end(const uint8_t *poly)
 	// would cover the mirrored landscape near the coast
 	if (!water && (flags & mm7::TileShore)) {
 	} else if (water) {
+		float z = 0;
+		for (uint32_t i = 0; i < n; ++i) z += sv[i].wz;
+		z /= n;
+		WaterLevel *lv = nullptr;
+		for (auto &l : s_mir_levels)
+			if (std::fabs(l.z - z) < 24.0f) { lv = &l; break; }
+		if (!lv) { s_mir_levels.push_back({z, {0, 0, 0}, 0}); lv = &s_mir_levels.back(); }
 		for (uint32_t i = 0; i < n; ++i) {
-			s_mir_water_sum[0] += sv[i].vx; s_mir_water_sum[1] += sv[i].vy; s_mir_water_sum[2] += sv[i].vz;
+			lv->sum[0] += sv[i].vx; lv->sum[1] += sv[i].vy; lv->sum[2] += sv[i].vz;
 		}
+		lv->n += n;
 		s_mir_water_cnt += n;
 	} else if (s_mir_have_verts && s_mir_cur_tex) {
 		s_mir_polys.push_back({s_mir_cur_tex, static_cast<uint32_t>(s_mir_verts.size()), n});
@@ -827,10 +956,16 @@ static bool mirror_render()
 	const float len = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
 	if (len < 1e-6f)
 		return false;
+	const WaterLevel *dom = nullptr;
+	for (const auto &l : s_mir_levels)
+		if (!dom || l.n > dom->n) dom = &l;
+	if (!dom || !dom->n)
+		return false;
+	s_mirror_level_z = dom->z;
 	float d = 0;
 	for (int k = 0; k < 3; ++k) {
 		nrm[k] /= len;
-		d += nrm[k] * static_cast<float>(s_mir_water_sum[k] / s_mir_water_cnt);
+		d += nrm[k] * static_cast<float>(dom->sum[k] / dom->n);
 	}
 	if (d > 0) { // the camera (view origin) is above the water: dot(n, 0) - d > 0
 		for (float &c : nrm) c = -c;
@@ -982,6 +1117,25 @@ static void draw_water_batch()
 	const int32_t *rr = reinterpret_cast<const int32_t *>(mm7::RenderRect);
 	const float viewc[4] = {float(rr[0]), float(rr[1]), float(rr[2]), float(rr[3])};
 	s_dev->SetPixelShaderConstantF(9, viewc, 1);
+	{
+		// sun from game time: rises in the east (+X) at 6:00, culminates in the south (-Y), sets in the west at 18:00
+		const int hour = *reinterpret_cast<const int32_t *>(0xACD554), minute = *reinterpret_cast<const int32_t *>(0xACD558);
+		const float tday = (hour + minute / 60.0f - 6.0f) / 12.0f * 3.14159265f; // 0 at sunrise, pi at sunset
+		float sx = std::cos(tday), sy = -0.45f * std::sin(tday), sz = std::sin(tday);
+		const float sl = std::sqrt(sx * sx + sy * sy + sz * sz);
+		sx /= sl; sy /= sl; sz /= sl;
+		const float sun_i = sz > 0 ? std::min(1.0f, sz * 4.0f) : 0.0f;
+		const float wc[12] = {s_cam[0], s_cam[1], s_cam[2], s_basis_ok ? 1.0f : 0.0f,
+		                      sx, sy, sz, sun_i,
+		                      s_water_z, 0.55f, 260.0f, 0.0f};
+		s_dev->SetPixelShaderConstantF(10, wc, 3);
+		s_dev->SetTexture(3, s_wave_tex);
+		s_dev->SetSamplerState(3, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+		s_dev->SetSamplerState(3, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+		s_dev->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+		s_dev->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+		s_dev->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+	}
 	s_dev->SetVertexShaderConstantF(0, s_dxw_off, 1);
 	s_dev->SetVertexShaderConstantF(1, s_dxw_mul, 1);
 	const float gfc[4] = {s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1]};
@@ -1011,7 +1165,7 @@ static void draw_water_batch()
 	s_dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 	s_dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 	IDirect3DBaseTexture9 *bound = nullptr;
-	int shore = -1;
+	int shore = -1, level_on = -1;
 	for (const auto &p : s_water_polys) {
 		if (!p.tex)
 			continue; // overlay-only (shore layer)
@@ -1023,6 +1177,13 @@ static void draw_water_batch()
 			shore = p.shore;
 			const float sc[4] = {float(shore), 0, 0, 0};
 			s_dev->SetPixelShaderConstantF(8, sc, 1);
+		}
+		// planar mirror only for water at the mirror plane's level; ponds at other heights: angular sky reflection
+		const int on = planar && std::fabs(p.z - s_mirror_level_z) < 24.0f;
+		if (on != level_on) {
+			level_on = on;
+			const float mc[4] = {float(on), s_mode == Mode::DebugReflection ? 1.0f : 0.0f, 0, 0};
+			s_dev->SetPixelShaderConstantF(7, mc, 1);
 		}
 		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
 	}
@@ -1289,6 +1450,8 @@ static void on_destroy_device(device *)
 	release_mirror_resources();
 	if (s_state) s_state->Release();
 	if (s_water_ps) s_water_ps->Release();
+	if (s_wave_tex) s_wave_tex->Release();
+	s_wave_tex = nullptr;
 	if (s_overlay_ps) s_overlay_ps->Release();
 	s_overlay_ps = nullptr;
 	if (s_water_vs) s_water_vs->Release();
