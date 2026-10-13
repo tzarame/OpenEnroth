@@ -633,6 +633,29 @@ static void release_captured()
 static bool s_water_drawn_this_frame = false;
 static bool s_scene_ready = false; // s_scene_tex holds the previous frame (3D scene before billboards/UI)
 
+// The game's 3D view in render-target pixels (GrayFace scaling -> dxwrapper fix-up -> viewport). The render target
+// is desktop-sized (e.g. 1920x1080) but only a window-sized corner is shown: copies and clears are limited to it.
+static bool visible_rect(UINT w, UINT h, RECT &r)
+{
+	if (!s_game_vp.Width || !s_dxw_mul[0] || !s_dxw_mul[1])
+		return false;
+	const int32_t *rr = reinterpret_cast<const int32_t *>(mm7::RenderRect);
+	auto px = [](float gx, float gy, float &x, float &y) {
+		const float nx = (gx * s_gf_mul[0] + s_gf_add[0] + s_dxw_off[0]) * s_dxw_mul[0];
+		const float ny = (gy * s_gf_mul[1] + s_gf_add[1] + s_dxw_off[1]) * s_dxw_mul[1];
+		x = s_game_vp.X + (nx + 1.0f) * 0.5f * s_game_vp.Width;
+		y = s_game_vp.Y + (1.0f - ny) * 0.5f * s_game_vp.Height;
+	};
+	float x0, y0, x1, y1;
+	px(float(rr[0]), float(rr[1]), x0, y0);
+	px(float(rr[2]), float(rr[3]), x1, y1);
+	r.left = std::clamp(static_cast<LONG>(std::floor(std::min(x0, x1))) - 2, 0L, static_cast<LONG>(w));
+	r.top = std::clamp(static_cast<LONG>(std::floor(std::min(y0, y1))) - 2, 0L, static_cast<LONG>(h));
+	r.right = std::clamp(static_cast<LONG>(std::ceil(std::max(x0, x1))) + 2, 0L, static_cast<LONG>(w));
+	r.bottom = std::clamp(static_cast<LONG>(std::ceil(std::max(y0, y1))) + 2, 0L, static_cast<LONG>(h));
+	return r.right > r.left && r.bottom > r.top;
+}
+
 static bool copy_scene()
 {
 	IDirect3DSurface9 *rt = s_game_rt;
@@ -655,7 +678,9 @@ static bool copy_scene()
 	}
 	IDirect3DSurface9 *dst = nullptr;
 	s_scene_tex->GetSurfaceLevel(0, &dst);
-	const HRESULT hr = s_dev->StretchRect(rt, nullptr, dst, nullptr, D3DTEXF_NONE);
+	RECT vr;
+	const bool part = visible_rect(rd.Width, rd.Height, vr);
+	const HRESULT hr = s_dev->StretchRect(rt, part ? &vr : nullptr, dst, part ? &vr : nullptr, D3DTEXF_NONE);
 	dst->Release();
 	rt->Release();
 	if (FAILED(hr))
@@ -800,7 +825,9 @@ static bool copy_rt_to_tex(IDirect3DSurface9 *rt, IDirect3DTexture9 *&tex)
 		return false;
 	IDirect3DSurface9 *dst = nullptr;
 	tex->GetSurfaceLevel(0, &dst);
-	const HRESULT hr = s_dev->StretchRect(rt, nullptr, dst, nullptr, D3DTEXF_NONE);
+	RECT vr;
+	const bool part = visible_rect(rd.Width, rd.Height, vr);
+	const HRESULT hr = s_dev->StretchRect(rt, part ? &vr : nullptr, dst, part ? &vr : nullptr, D3DTEXF_NONE);
 	dst->Release();
 	return SUCCEEDED(hr);
 }
@@ -1038,7 +1065,20 @@ static bool mirror_render()
 	s_dev->SetRenderTarget(0, mrt);
 	s_dev->SetDepthStencilSurface(s_mirror_depth);
 	s_dev->SetViewport(&s_game_vp);
-	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+	{
+		D3DSURFACE_DESC cd;
+		IDirect3DSurface9 *cur = nullptr;
+		s_dev->GetRenderTarget(0, &cur);
+		cur->GetDesc(&cd);
+		cur->Release();
+		RECT vr;
+		if (visible_rect(cd.Width, cd.Height, vr)) {
+			const D3DRECT dr = {vr.left, vr.top, vr.right, vr.bottom};
+			s_dev->Clear(1, &dr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+		} else {
+			s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+		}
+	}
 	const float zn = 16.0f, zf = 65536.0f;
 	const float vc[24] = {nrm[0], nrm[1], nrm[2], d, ax, bx, ay, by,
 	                      s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1],
@@ -1757,7 +1797,20 @@ static void fog_render()
 	s_dev->SetRenderTarget(0, depth_rt);
 	s_dev->SetDepthStencilSurface(s_fog_ds);
 	s_dev->SetViewport(&s_fog_vp);
-	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+	{
+		D3DSURFACE_DESC cd;
+		IDirect3DSurface9 *cur = nullptr;
+		s_dev->GetRenderTarget(0, &cur);
+		cur->GetDesc(&cd);
+		cur->Release();
+		RECT vr;
+		if (visible_rect(cd.Width, cd.Height, vr)) {
+			const D3DRECT dr = {vr.left, vr.top, vr.right, vr.bottom};
+			s_dev->Clear(1, &dr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+		} else {
+			s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+		}
+	}
 	s_dev->SetVertexShaderConstantF(0, vc, 5);
 	s_dev->SetPixelShaderConstantF(0, vc, 5);
 	s_dev->SetPixelShaderConstantF(5, pc, 14);
