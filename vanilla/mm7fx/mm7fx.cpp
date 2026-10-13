@@ -50,6 +50,9 @@ constexpr uintptr_t SoftVertices = 0x50AA90;            // RenderVertexSoft[], s
 constexpr uintptr_t TLVertices = 0x77E448;              // D3DTLVERTEX[], stride 0x20, filled by DrawTerrainPolygon
 constexpr size_t PolygonFlags = 0x30;                   // i16
 constexpr uint16_t TileWater = 2;
+// The game always renders in a 640x480 logical screen; dxwrapper stretches it to the D3D9 back buffer.
+// ponytail: assumes a plain stretch (no letterbox); read dxwrapper's scaling if a mode ever letterboxes.
+constexpr float ScreenW = 640.0f, ScreenH = 480.0f;
 
 struct SoftVertex { float wx, wy, wz, vx, vy, vz, px, py, rhw, u, v, pad; };
 struct TLVertex { float x, y, z, rhw; uint32_t diffuse, specular; float u, v; };
@@ -130,9 +133,11 @@ static void capture_water_poly()
 
 	WaterPoly wp = {nullptr, static_cast<uint32_t>(s_water_verts.size()), n};
 	s_dev->GetTexture(0, &wp.tex); // AddRef'd, released after drawing
+	const float sx = rd.Width / mm7::ScreenW, sy = rd.Height / mm7::ScreenH;
 	for (uint32_t i = 0; i < n; ++i) {
 		const auto &t = tl[i];
-		s_water_verts.push_back({t.x, t.y, t.z, t.rhw, t.diffuse, t.u, t.v, t.x / rd.Width, t.y / rd.Height});
+		// -0.5: D3D9 rasterizes pixel centers at integer coords, D3D7 TL vertices at +0.5
+		s_water_verts.push_back({t.x * sx - 0.5f, t.y * sy - 0.5f, t.z, t.rhw, t.diffuse, t.u, t.v, t.x / mm7::ScreenW, t.y / mm7::ScreenH});
 	}
 	s_water_polys.push_back(wp);
 
@@ -276,7 +281,7 @@ static void draw_water()
 	}
 
 	solve_horizon();
-	const float horizon_uv = s_horizon_px >= 0 ? s_horizon_px / rd.Height : 0.35f;
+	const float horizon_uv = s_horizon_px >= 0 ? s_horizon_px / mm7::ScreenH : 0.35f; // fit is in game screen units
 	const float params[4] = {GetTickCount() * 0.001f, horizon_uv, 0.75f, 0.0f};
 
 	s_state->Capture();
@@ -341,7 +346,9 @@ static bool is_water(const uint8_t *poly)
 	return *reinterpret_cast<const int16_t *>(poly + mm7::PolygonFlags) & mm7::TileWater;
 }
 
-static bool on_draw(command_list *cmd, uint32_t, uint32_t, uint32_t, uint32_t)
+static uint32_t s_dbg_left = 0; // diagnostic lines left for the current 5 s window
+
+static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t first_vertex, uint32_t)
 {
 	++s_draws;
 	if (!s_dev)
@@ -356,6 +363,13 @@ static bool on_draw(command_list *cmd, uint32_t, uint32_t, uint32_t, uint32_t)
 	++s_water_draws;
 	switch (s_mode) {
 	case Mode::Effect:
+		if (s_dbg_left) {
+			--s_dbg_left;
+			const auto *tl = reinterpret_cast<const mm7::TLVertex *>(mm7::TLVertices);
+			log_info("mm7fx dbg: draw vc=%u first=%u captured=%d n=%u grid=(%d,%d) tl0=(%.1f,%.1f,%.4f) tl1=(%.1f,%.1f) tl2=(%.1f,%.1f)",
+				vertex_count, first_vertex, s_poly_captured, s_current_n, (int)(int8_t)s_current_poly[0x5D], (int)(int8_t)s_current_poly[0x5C],
+				tl[0].x, tl[0].y, tl[0].z, tl[1].x, tl[1].y, tl[2].x, tl[2].y);
+		}
 		if (!s_poly_captured) {
 			s_poly_captured = true;
 			capture_water_poly();
@@ -387,6 +401,7 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
 	const DWORD now = GetTickCount();
 	if (now - s_last_log >= 5000) {
 		s_last_log = now;
+		s_dbg_left = 2;
 		log_info("mm7fx: frame %u: %u draws, %u terrain, %u water, horizon y %.1f px, mode %d",
 			s_frame, s_draws, s_terrain_draws, s_water_draws, s_horizon_px, static_cast<int>(s_mode));
 	}
