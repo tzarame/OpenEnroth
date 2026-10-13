@@ -364,13 +364,13 @@ VSOut main(VSIn i)
 
 // shore layer drawn over our water: plain texture * vertex colour, alpha from the texture (like vanilla)
 static const char s_overlay_ps_src[] = R"(
-sampler2D layerTex : register(s1);
+sampler2D layerTex : register(s1);    // POINT: colour without bleeding from transparent texels
+sampler2D layerTexLin : register(s4); // LINEAR: smooth alpha edge
 float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0) : COLOR
 {
-	float4 t = tex2D(layerTex, uv);
-	// transparent texels are black, so the bilinear-filtered colour is already premultiplied by alpha:
-	// blended with ONE / INVSRCALPHA this gives clean edges (straight alpha gave a dark outline, dividing by
-	// alpha a bright one)
+	float4 t = float4(tex2D(layerTex, uv).rgb, tex2D(layerTexLin, uv).a);
+	// sampled with POINT filtering (see the overlay pass): the transparent texels' colour must not bleed into
+	// the edge (linear filtering gave dark or bright outlines whatever the blend mode)
 	return float4(t.rgb * color.rgb, t.a); // vertex alpha is not meaningful for terrain
 }
 )";
@@ -1198,6 +1198,7 @@ static void draw_water_batch()
 	}
 	// seal T-junction cracks between neighbouring (near-clipped) water polygons: the same polygons as lines
 	s_dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+	s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESS); // only into cracks, never over coplanar neighbouring land
 	for (const auto &p : s_water_polys) {
 		if (!p.tex)
 			continue;
@@ -1205,18 +1206,26 @@ static void draw_water_batch()
 		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
 	}
 	s_dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+	s_dev->SetRenderState(D3DRS_ZFUNC, s_game_zfunc);
 	// shore layers on top of the water, blended like vanilla did
 	if (s_mode == Mode::Effect) {
 		s_dev->SetPixelShader(s_overlay_ps);
 		s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-		s_dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE); // premultiplied (see s_overlay_ps_src)
-		s_dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+		s_dev->SetRenderState(D3DRS_SRCBLEND, s_overlay_src);
+		s_dev->SetRenderState(D3DRS_DESTBLEND, s_overlay_dst);
+		s_dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+		s_dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+		s_dev->SetSamplerState(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+		s_dev->SetSamplerState(4, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+		s_dev->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+		s_dev->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 		s_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 		s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
 		for (const auto &p : s_water_polys) {
 			if (!p.overlay)
 				continue;
 			s_dev->SetTexture(1, p.overlay);
+			s_dev->SetTexture(4, p.overlay);
 			s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
 		}
 	}
