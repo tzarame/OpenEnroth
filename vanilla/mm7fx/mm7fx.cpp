@@ -1196,6 +1196,15 @@ static void draw_water_batch()
 		}
 		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
 	}
+	// seal T-junction cracks between neighbouring (near-clipped) water polygons: the same polygons as lines
+	s_dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+	for (const auto &p : s_water_polys) {
+		if (!p.tex)
+			continue;
+		s_dev->SetTexture(1, p.tex);
+		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
+	}
+	s_dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
 	// shore layers on top of the water, blended like vanilla did
 	if (s_mode == Mode::Effect) {
 		s_dev->SetPixelShader(s_overlay_ps);
