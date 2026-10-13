@@ -29,3 +29,17 @@ Why:
    (e.g. via a marker render-state or by texture), draw them with our shader (SSR → later planar mirror).
 4. Shadows: blob shadows for billboards → sun shadow map from static geometry (models + terrain + tree cards),
    refreshed every few game minutes.
+
+## Water pass v2 (design, after the chain is confirmed working)
+
+1. Capture: in `on_draw`, while inside `DrawTerrainPolygon` with `flags & 2`, skip the draw and copy its TL vertices
+   (game's D3DTLVERTEX array at 0x77E448, stride 0x20: x,y,z,rhw,diffuse,specular,u,v) + the bound water texture.
+   Only the first draw per polygon (base texture); the following lightmap/fog draws of the same polygon are dropped.
+2. Draw point: detour `Render::DrawBillboards_And_MaybeRenderSpecialEffects_And_EndScene` @ 0x4A1F71
+   (`__thiscall`, no args; first insn `dec [ecx+0x4010C]` = 6 bytes). When `[ecx+0x4010C] == 1` the scene is about to
+   end: terrain/buildings/sky are drawn, billboards/effects/UI are not. Draw captured water there, then call original.
+3. Shader: ps_3_0 compiled at runtime with `D3DCompile` from d3dcompiler_47.dll (native on Windows, vkd3d in Proton).
+   XYZRHW vertices + pixel shader is legal in D3D9. Inputs: copy of the back buffer (scene so far), water texture,
+   time, camera pitch. Reflection: mirror the screen around the horizon line + animated ripple offset;
+   Fresnel from distance to horizon; mix with the original water texture.
+4. Later: replace the screen-space mirror with a real mirrored pass using `Map.Models` / terrain geometry.
