@@ -242,18 +242,6 @@ static void capture_water_poly()
 	WaterPoly wp = {s_poly_tex, static_cast<uint32_t>(s_water_verts.size()), n, shore && !layer && false, s_poly_overlay};
 	s_poly_tex = nullptr; // references move to the poly
 	s_poly_overlay = nullptr;
-	// consistency check: TL x/y must equal the soft vertices' projected x/y
-	static uint32_t mism = 0, total = 0;
-	for (uint32_t i = 0; i < n; ++i) {
-		++total;
-		if (std::fabs(tl[i].x - sv[i].px) > 0.5f || std::fabs(tl[i].y - sv[i].py) > 0.5f) ++mism;
-	}
-	static DWORD last_chk = 0;
-	if (GetTickCount() - last_chk > 5000) {
-		last_chk = GetTickCount();
-		log_info("mm7fx dbg: TL vs soft projection mismatches %u / %u", mism, total);
-		mism = total = 0;
-	}
 	for (uint32_t i = 0; i < n; ++i) {
 		const auto &t = tl[i];
 		s_zmin = t.z < s_zmin ? t.z : s_zmin; s_zmax = t.z > s_zmax ? t.z : s_zmax;
@@ -854,20 +842,22 @@ static bool mirror_render()
 	D3DSURFACE_DESC md = {};
 	if (s_mirror_tex)
 		s_mirror_tex->GetLevelDesc(0, &md);
-	if (!s_mirror_tex || md.Width != rd.Width || md.Height != rd.Height) {
+	// half resolution: the reflection is blurred by ripples anyway, a quarter of the fill rate
+	const UINT mw = (rd.Width + 1) / 2, mh = (rd.Height + 1) / 2;
+	if (!s_mirror_tex || md.Width != mw || md.Height != mh) {
 		if (s_mirror_tex) s_mirror_tex->Release();
 		if (s_mirror_depth) s_mirror_depth->Release();
 		s_mirror_tex = nullptr;
 		s_mirror_depth = nullptr;
-		if (FAILED(s_dev->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &s_mirror_tex, nullptr)) ||
-		    FAILED(s_dev->CreateDepthStencilSurface(rd.Width, rd.Height, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, TRUE, &s_mirror_depth, nullptr))) {
-			log_info("mm7fx: mirror target %ux%u failed", rd.Width, rd.Height);
+		if (FAILED(s_dev->CreateTexture(mw, mh, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &s_mirror_tex, nullptr)) ||
+		    FAILED(s_dev->CreateDepthStencilSurface(mw, mh, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, TRUE, &s_mirror_depth, nullptr))) {
+			log_info("mm7fx: mirror target %ux%u failed", mw, mh);
 			if (s_mirror_tex) s_mirror_tex->Release();
 			s_mirror_tex = nullptr;
 			s_mirror_init_failed = true; // don't retry every frame
 			return false;
 		}
-		log_info("mm7fx: mirror target %ux%u", rd.Width, rd.Height);
+		log_info("mm7fx: mirror target %ux%u", mw, mh);
 	}
 
 	// one triangle list per texture
@@ -882,7 +872,9 @@ static bool mirror_render()
 	s_dev->GetDepthStencilSurface(&prev_ds);
 	s_dev->SetRenderTarget(0, mrt);
 	s_dev->SetDepthStencilSurface(s_mirror_depth);
-	s_dev->SetViewport(&s_game_vp);
+	D3DVIEWPORT9 hvp = s_game_vp; // same mapping at half scale
+	hvp.X /= 2; hvp.Y /= 2; hvp.Width = (hvp.Width + 1) / 2; hvp.Height = (hvp.Height + 1) / 2;
+	s_dev->SetViewport(&hvp);
 	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
 	const float zn = 16.0f, zf = 65536.0f;
 	const float vc[24] = {nrm[0], nrm[1], nrm[2], d, ax, bx, ay, by,
