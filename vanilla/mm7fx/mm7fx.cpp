@@ -456,7 +456,15 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 world : TEXCOOR
 	               + tex2D(sceneTex, float2(clamp(ruv.x, lo.x, hi.x), ty)).rgb + tex2D(sceneTex, float2(clamp(ruv.x + 0.06, lo.x, hi.x), ty)).rgb
 	               + tex2D(sceneTex, float2(clamp(ruv.x + 0.12, lo.x, hi.x), ty)).rgb) * 0.2;
 	refl = lerp(skyTop, refl, inside);
-	float4 mr = tex2D(mirrorTex, clamp((vpos + 0.5) * rt.xy + rip, lo, hi));
+	// 1px cracks between mirrored polygons (T-junctions) let the sky through: fill from the neighbours
+	float2 mc = clamp((vpos + 0.5) * rt.xy + rip, lo, hi);
+	float4 mr = tex2D(mirrorTex, mc);
+	float4 m1 = tex2D(mirrorTex, mc + float2(rt.x, 0.0)), m2 = tex2D(mirrorTex, mc - float2(rt.x, 0.0));
+	float4 m3 = tex2D(mirrorTex, mc + float2(0.0, rt.y)), m4 = tex2D(mirrorTex, mc - float2(0.0, rt.y));
+	float wsum = m1.a + m2.a + m3.a + m4.a;
+	float3 nb = (m1.rgb * m1.a + m2.rgb * m2.a + m3.rgb * m3.a + m4.rgb * m4.a) / max(wsum, 1e-3);
+	float fill = (1.0 - mr.a) * saturate(wsum - 1.0); // at least two covered neighbours: a crack, not an edge
+	mr = float4(lerp(mr.rgb, nb, fill), max(mr.a, fill));
 	refl = lerp(refl, mr.rgb, mr.a * mir.x);
 	inside = lerp(inside, 1.0, mir.x);
 	if (mir.y > 0.5)
@@ -1199,17 +1207,6 @@ static void draw_water_batch()
 		}
 		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
 	}
-	// seal T-junction cracks between neighbouring (near-clipped) water polygons: the same polygons as lines
-	s_dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
-	s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESS); // only into cracks, never over coplanar neighbouring land
-	for (const auto &p : s_water_polys) {
-		if (!p.tex)
-			continue;
-		s_dev->SetTexture(1, p.tex);
-		s_dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, p.count - 2, &s_water_verts[p.first], sizeof(WaterVertex));
-	}
-	s_dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
-	s_dev->SetRenderState(D3DRS_ZFUNC, s_game_zfunc);
 	// shore layers on top of the water, blended like vanilla did
 	if (s_mode == Mode::Effect) {
 		s_dev->SetPixelShader(s_overlay_ps);
