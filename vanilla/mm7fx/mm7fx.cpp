@@ -9,6 +9,9 @@
 //   - detour Render::DrawBillboards_And_MaybeRenderSpecialEffects_And_EndScene: copy the finished 3D scene
 //     (before billboards/UI) as the reflection source for the next frame;
 //   - horizon line is derived from the captured vertices (world/view/screen), no FOV guessing.
+//   - planar mirror (v3): terrain tiles and building faces (Render::DrawPolygon) are captured in view space,
+//     mirrored about the water plane and re-rendered from the game's own projection into an offscreen target;
+//     the sky comes from a copy of the frame taken right after the sky pass (angular mirror is exact at infinity).
 //   F10 cycles: water effect -> vanilla -> hide water -> hide all terrain.
 #include <reshade.hpp>
 #include <d3d9.h>
@@ -17,6 +20,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 #include <windows.h>
 
@@ -47,6 +51,8 @@ constexpr uintptr_t DrawTerrainPolygon = 0x4A264C;      // __thiscall(Render*, n
 constexpr uint8_t DrawTerrainPolygonPrologue[] = {0x55, 0x8B, 0xEC, 0x51, 0x53};
 constexpr uintptr_t EndSceneBillboards = 0x4A1F71;      // __thiscall(Render*), draws billboards/effects, EndScene
 constexpr uint8_t EndSceneBillboardsPrologue[] = {0xFF, 0x89, 0x0C, 0x01, 0x04, 0x00}; // dec [ecx+0x4010C]
+constexpr uintptr_t DrawPolygon = 0x4A1FE0;             // __thiscall(Render*, n, Polygon*, ODMFace*, tex); building faces
+constexpr uint8_t DrawPolygonPrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10}; // push ebp; mov ebp,esp; sub esp,10h
 constexpr uintptr_t DrawBuildingsD3D = 0x478411;        // __thiscall(Render*); terrain is done when it starts
 constexpr uint8_t DrawBuildingsD3DPrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x4C}; // push ebp; mov ebp,esp; sub esp,4Ch
 constexpr size_t RenderSceneDepth = 0x4010C;            // BeginScene nesting counter
@@ -93,7 +99,7 @@ static bool install_detour(uintptr_t target, const uint8_t (&expected)[N], void 
 
 // ---- state -----------------------------------------------------------------------------------
 
-enum class Mode { Effect, Vanilla, HideWater, HideTerrain, DebugSolid };
+enum class Mode { Effect, Vanilla, HideWater, HideTerrain, DebugSolid, DebugReflection };
 static Mode s_mode = Mode::Effect;
 static bool s_f10_was_down = false;
 
@@ -266,8 +272,10 @@ static void capture_water_poly()
 			for (uint32_t j = 0; j < n; ++j) {
 				const float dwx = sv[j].wx - sv[i].wx, dwy = sv[j].wy - sv[i].wy;
 				const float dv[3] = {sv[j].vx - sv[i].vx, sv[j].vy - sv[i].vy, sv[j].vz - sv[i].vz};
-				if (!gx && std::fabs(dwx) > 100 && std::fabs(dwy) < 1) { for (int k = 0; k < 3; ++k) rx[k] = dv[k] / dwx; gx = true; }
-				if (!gy && std::fabs(dwy) > 100 && std::fabs(dwx) < 1) { for (int k = 0; k < 3; ++k) ry[k] = dv[k] / dwy; gy = true; }
+				// near-clipped vertices keep stale world positions: the view delta must be as long as the world delta
+				const float dvl = std::sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+				if (!gx && std::fabs(dwx) > 100 && std::fabs(dwy) < 1 && std::fabs(dvl - std::fabs(dwx)) < 0.01f * std::fabs(dwx)) { for (int k = 0; k < 3; ++k) rx[k] = dv[k] / dwx; gx = true; }
+				if (!gy && std::fabs(dwy) > 100 && std::fabs(dwx) < 1 && std::fabs(dvl - std::fabs(dwy)) < 0.01f * std::fabs(dwy)) { for (int k = 0; k < 3; ++k) ry[k] = dv[k] / dwy; gy = true; }
 			}
 		if (gx && gy) {
 			s_fit.up[0] = rx[1] * ry[2] - rx[2] * ry[1];
@@ -331,6 +339,8 @@ float4 vp : register(c3);     // viewport X, Y, W, H
 float4 off : register(c4);    // dxwrapper fix-up offset
 float4 mul : register(c5);    // dxwrapper fix-up multiplier
 float4 gf : register(c6);     // GrayFace HD scaling: xy * gf.xy + gf.zw
+float4 mir : register(c7);    // x = planar mirror in mirrorTex (sceneTex = sky only), y = debug: reflection only
+sampler2D mirrorTex : register(s2);
 float2 to_game(float2 px)     // RT pixel -> game TL screen coords
 {
 	float2 ndc = float2((px.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (px.y - vp.y) / vp.w * 2.0);
@@ -355,9 +365,17 @@ float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float2 vpos : VPOS) : 
 	float below = max(y - extra.y, 0.0) * extra.z;
 	float2 ruv = to_rt_uv(float2(gp.x, yr)) + rip * (1.0 + below * 6.0);
 	float top = vp.y * rt.y;
-	float inside = saturate((ruv.y - top) * 40.0);     // reflected ray left the top of the view: no data
+	float inside = saturate((ruv.y - top) * 8.0);      // reflected ray left the top of the view: no data
 	ruv = float2(clamp(ruv.x, vp.x * rt.x, (vp.x + vp.z) * rt.x), clamp(ruv.y, top, (vp.y + vp.w) * rt.y));
 	float3 refl = tex2D(sceneTex, ruv).rgb;
+	// planar mirror: mirrored geometry rendered for this very pixel (alpha = coverage), the sky behind it is
+	// exact under the angular mirror, so clamping at the top only stretches the zenith sky
+	float2 lo = vp.xy * rt.xy, hi = (vp.xy + vp.zw) * rt.xy;
+	float4 m = tex2D(mirrorTex, clamp((vpos + 0.5) * rt.xy + rip * (1.0 + below * 6.0), lo, hi));
+	refl = lerp(refl, m.rgb, m.a * mir.x);
+	inside = lerp(inside, 1.0, mir.x);
+	if (mir.y > 0.5)
+		return float4(refl, 1.0);
 	float3 base = tex2D(waterTex, uv + rip * 4.0).rgb * color.rgb;
 	float fresnel = saturate(1.0 - below * 3.5);
 	float k = extra.x * (0.35 + 0.55 * fresnel) * inside;
@@ -460,6 +478,354 @@ static bool copy_scene()
 	return SUCCEEDED(hr);
 }
 
+// ---- planar mirror pass ----------------------------------------------------------------------
+// Render::DrawTerrainPolygon and Render::DrawPolygon (building faces) both draw from the soft vertex array at
+// 0x50AA90 after clipping, so view-space positions are valid for every vertex (near/far-clipped ones have stale
+// world positions, which is why everything here stays in view space: x = forward, y = left, z = up).
+// The game projects px = cx - f * y / x, py = cy - f * z / x; we fit both lines per frame from the captured
+// vertices, mirror view positions about the water plane (normal = camera "up" from the horizon fit) and push them
+// through the same GrayFace + dxwrapper mapping as the water, as homogeneous clip coordinates so the GPU clips.
+
+struct MirrorVertex { float x, y, z; uint32_t diffuse; float u, v; };
+static const D3DVERTEXELEMENT9 s_mirror_decl_elems[] = {
+	{0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
+	{0, 12, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
+	{0, 16, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
+	D3DDECL_END()};
+struct MirrorPoly { IDirect3DBaseTexture9 *tex; uint32_t first, count; };
+
+struct LinFit {
+	double n = 0, st = 0, sy = 0, stt = 0, sty = 0;
+	void add(double t, double y) { n += 1; st += t; sy += y; stt += t * t; sty += t * y; }
+	bool solve(float &a, float &b) const
+	{
+		const double det = n * stt - st * st;
+		if (n < 8 || std::fabs(det) < 1e-9)
+			return false;
+		b = static_cast<float>((n * sty - st * sy) / det);
+		a = static_cast<float>((sy - b * st) / n);
+		return true;
+	}
+};
+
+static std::vector<MirrorVertex> s_mir_verts, s_mir_tris;
+static std::vector<MirrorPoly> s_mir_polys;
+static std::vector<uint32_t> s_mir_order;
+static uint32_t s_mir_n = 0;                       // > 0 while inside a hooked polygon draw
+static bool s_mir_have_verts = false;              // vertices of the current polygon taken at its first draw
+static MirrorVertex s_mir_cur[64];
+static IDirect3DBaseTexture9 *s_mir_cur_tex = nullptr; // first non-null texture of the current polygon (AddRef'd)
+static LinFit s_mir_fit_x, s_mir_fit_y;
+static double s_mir_water_sum[3] = {};             // view-space sum of water vertices -> plane offset
+static uint32_t s_mir_water_cnt = 0;
+static bool s_sky_pending = false, s_sky_ready = false;
+static IDirect3DTexture9 *s_sky_tex = nullptr;     // frame right after the sky pass (sky only)
+static IDirect3DTexture9 *s_mirror_tex = nullptr;  // mirrored geometry, alpha = coverage
+static IDirect3DSurface9 *s_mirror_depth = nullptr;
+static IDirect3DVertexShader9 *s_mirror_vs = nullptr;
+static IDirect3DPixelShader9 *s_mirror_ps = nullptr;
+static IDirect3DVertexDeclaration9 *s_mirror_decl = nullptr;
+static bool s_mirror_init_failed = false;
+
+static bool mirror_wanted()
+{
+	return s_mode == Mode::Effect || s_mode == Mode::DebugSolid || s_mode == Mode::DebugReflection;
+}
+
+static void mirror_release_captured()
+{
+	for (auto &p : s_mir_polys)
+		if (p.tex) p.tex->Release();
+	s_mir_polys.clear();
+	s_mir_verts.clear();
+	s_mir_fit_x = LinFit();
+	s_mir_fit_y = LinFit();
+	s_mir_water_sum[0] = s_mir_water_sum[1] = s_mir_water_sum[2] = 0;
+	s_mir_water_cnt = 0;
+	s_sky_ready = false;
+}
+
+// Copies a render target into a same-sized texture (created on demand).
+static bool copy_rt_to_tex(IDirect3DSurface9 *rt, IDirect3DTexture9 *&tex)
+{
+	D3DSURFACE_DESC rd, td;
+	rt->GetDesc(&rd);
+	if (tex && (tex->GetLevelDesc(0, &td), td.Width != rd.Width || td.Height != rd.Height || td.Format != rd.Format)) {
+		tex->Release();
+		tex = nullptr;
+	}
+	if (!tex && FAILED(s_dev->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, rd.Format, D3DPOOL_DEFAULT, &tex, nullptr)))
+		return false;
+	IDirect3DSurface9 *dst = nullptr;
+	tex->GetSurfaceLevel(0, &dst);
+	const HRESULT hr = s_dev->StretchRect(rt, nullptr, dst, nullptr, D3DTEXF_NONE);
+	dst->Release();
+	return SUCCEEDED(hr);
+}
+
+// Called from on_draw for every draw. Sky copy at the first terrain/building draw of the frame (the sky pass is done
+// by then), vertices + base texture of the current polygon at its first draw (later passes overwrite diffuse).
+static void mirror_on_draw()
+{
+	if (!s_mir_n || !s_dev)
+		return;
+	if (s_sky_pending) {
+		s_sky_pending = false;
+		IDirect3DSurface9 *rt = nullptr;
+		if (SUCCEEDED(s_dev->GetRenderTarget(0, &rt)) && rt) {
+			s_sky_ready = copy_rt_to_tex(rt, s_sky_tex);
+			rt->Release();
+		}
+	}
+	if (!s_mir_have_verts) {
+		s_mir_have_verts = true;
+		const auto *tl = reinterpret_cast<const mm7::TLVertex *>(mm7::TLVertices);
+		const auto *sv = reinterpret_cast<const mm7::SoftVertex *>(mm7::SoftVertices);
+		for (uint32_t i = 0; i < s_mir_n; ++i)
+			s_mir_cur[i] = {sv[i].vx, sv[i].vy, sv[i].vz, tl[i].diffuse, tl[i].u, tl[i].v};
+	}
+	if (!s_mir_cur_tex)
+		s_dev->GetTexture(0, &s_mir_cur_tex);
+}
+
+static void mirror_begin(uint32_t n)
+{
+	s_mir_n = mirror_wanted() && n >= 3 && n <= 64 ? n : 0;
+	s_mir_have_verts = false;
+	s_mir_cur_tex = nullptr;
+}
+
+static void mirror_end(const uint8_t *poly)
+{
+	const uint32_t n = s_mir_n;
+	s_mir_n = 0;
+	if (!n)
+		return;
+	const auto *sv = reinterpret_cast<const mm7::SoftVertex *>(mm7::SoftVertices);
+	for (uint32_t i = 0; i < n; ++i)
+		if (sv[i].vx > 1.0f) {
+			s_mir_fit_x.add(sv[i].vy / sv[i].vx, sv[i].px);
+			s_mir_fit_y.add(sv[i].vz / sv[i].vx, sv[i].py);
+		}
+	const bool water = poly && (*reinterpret_cast<const int16_t *>(poly + mm7::PolygonFlags) & mm7::TileWater);
+	if (water) {
+		for (uint32_t i = 0; i < n; ++i) {
+			s_mir_water_sum[0] += sv[i].vx; s_mir_water_sum[1] += sv[i].vy; s_mir_water_sum[2] += sv[i].vz;
+		}
+		s_mir_water_cnt += n;
+	} else if (s_mir_have_verts && s_mir_cur_tex) {
+		s_mir_polys.push_back({s_mir_cur_tex, static_cast<uint32_t>(s_mir_verts.size()), n});
+		s_mir_cur_tex = nullptr; // reference moves to the poly
+		s_mir_verts.insert(s_mir_verts.end(), s_mir_cur, s_mir_cur + n);
+	}
+	if (s_mir_cur_tex) {
+		s_mir_cur_tex->Release();
+		s_mir_cur_tex = nullptr;
+	}
+}
+
+static const char s_mirror_vs_src[] = R"(
+struct VSIn { float3 pos : POSITION; float4 color : COLOR0; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : POSITION; float4 color : COLOR0; float2 uv : TEXCOORD0; float dist : TEXCOORD1; };
+float4 plane : register(c0); // view-space water plane dot(n, p) = d, n up
+float4 proj : register(c1);  // game px = proj.x + proj.y * y / x, py = proj.z + proj.w * z / x
+float4 gf : register(c2);    // GrayFace HD scaling
+float4 off : register(c3);   // dxwrapper fix-up offset
+float4 mul : register(c4);   // dxwrapper fix-up multiplier
+float4 zr : register(c5);    // x = near, y = far / (far - near)
+VSOut main(VSIn i)
+{
+	VSOut o;
+	o.dist = dot(plane.xyz, i.pos) - plane.w;
+	float3 p = i.pos - 2.0 * o.dist * plane.xyz;
+	float w = p.x;
+	float2 gw = float2(proj.x * w + proj.y * p.y, proj.z * w + proj.w * p.z); // game px * w
+	o.pos = float4((gw * gf.xy + (gf.zw + off.xy) * w) * mul.xy, (w - zr.x) * zr.y, w);
+	o.color = i.color;
+	o.uv = i.uv;
+	return o;
+}
+)";
+
+static const char s_mirror_ps_src[] = R"(
+sampler2D tex : register(s0);
+float4 main(float4 color : COLOR0, float2 uv : TEXCOORD0, float dist : TEXCOORD1) : COLOR
+{
+	clip(dist + 0.5);           // only geometry above the water plane is reflected
+	float4 t = tex2D(tex, uv);
+	clip(t.a - 0.5);            // color-keyed texels
+	return float4(t.rgb * color.rgb, 1.0);
+}
+)";
+
+static bool init_mirror_resources()
+{
+	if (s_mirror_ps || s_mirror_init_failed)
+		return s_mirror_ps != nullptr;
+	s_mirror_init_failed = true;
+	HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
+	auto compile = dc ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(dc, "D3DCompile")) : nullptr;
+	if (!compile)
+		return false;
+	ID3DBlob *vs = nullptr, *ps = nullptr, *err = nullptr;
+	HRESULT hr = compile(s_mirror_vs_src, sizeof(s_mirror_vs_src) - 1, "mm7fx_mirror", nullptr, nullptr, "main", "vs_3_0", 0, 0, &vs, &err);
+	if (SUCCEEDED(hr)) {
+		if (err) { err->Release(); err = nullptr; }
+		hr = compile(s_mirror_ps_src, sizeof(s_mirror_ps_src) - 1, "mm7fx_mirror", nullptr, nullptr, "main", "ps_3_0", 0, 0, &ps, &err);
+	}
+	if (FAILED(hr))
+		log_info("mm7fx: mirror shader compile failed 0x%08lx: %s", hr, err ? static_cast<const char *>(err->GetBufferPointer()) : "?");
+	if (err) err->Release();
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexShader(static_cast<const DWORD *>(vs->GetBufferPointer()), &s_mirror_vs);
+	if (SUCCEEDED(hr)) hr = s_dev->CreatePixelShader(static_cast<const DWORD *>(ps->GetBufferPointer()), &s_mirror_ps);
+	if (SUCCEEDED(hr)) hr = s_dev->CreateVertexDeclaration(s_mirror_decl_elems, &s_mirror_decl);
+	if (vs) vs->Release();
+	if (ps) ps->Release();
+	if (FAILED(hr)) {
+		log_info("mm7fx: mirror pass init failed 0x%08lx, screen-space reflection only", hr);
+		return false;
+	}
+	s_mirror_init_failed = false;
+	log_info("mm7fx: mirror pass ready");
+	return true;
+}
+
+static void release_mirror_resources()
+{
+	mirror_release_captured();
+	for (IUnknown **p : {reinterpret_cast<IUnknown **>(&s_sky_tex), reinterpret_cast<IUnknown **>(&s_mirror_tex),
+	                     reinterpret_cast<IUnknown **>(&s_mirror_depth), reinterpret_cast<IUnknown **>(&s_mirror_vs),
+	                     reinterpret_cast<IUnknown **>(&s_mirror_ps), reinterpret_cast<IUnknown **>(&s_mirror_decl)}) {
+		if (*p) (*p)->Release();
+		*p = nullptr;
+	}
+	s_sky_pending = false;
+}
+
+// Renders the mirrored scene into s_mirror_tex (same size/viewport as the game's target). Call with s_state captured;
+// restores it. False -> use the screen-space fallback.
+static bool mirror_render()
+{
+	if (!s_sky_ready || s_mir_polys.empty() || !s_fit.have_up || !s_mir_water_cnt || !s_game_rt || !init_mirror_resources())
+		return false;
+	float ax, bx, ay, by;
+	if (!s_mir_fit_x.solve(ax, bx) || !s_mir_fit_y.solve(ay, by) || !(bx * by > 0) || bx / by < 0.5f || bx / by > 2.0f)
+		return false; // not the expected pinhole projection (cx - f*y/x, cy - f*z/x)
+	float nrm[3] = {s_fit.up[0], s_fit.up[1], s_fit.up[2]};
+	const float len = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+	if (len < 1e-6f)
+		return false;
+	float d = 0;
+	for (int k = 0; k < 3; ++k) {
+		nrm[k] /= len;
+		d += nrm[k] * static_cast<float>(s_mir_water_sum[k] / s_mir_water_cnt);
+	}
+	if (d > 0) { // the camera (view origin) is above the water: dot(n, 0) - d > 0
+		for (float &c : nrm) c = -c;
+		d = -d;
+	}
+
+	D3DSURFACE_DESC rd;
+	s_game_rt->GetDesc(&rd);
+	D3DSURFACE_DESC md = {};
+	if (s_mirror_tex)
+		s_mirror_tex->GetLevelDesc(0, &md);
+	if (!s_mirror_tex || md.Width != rd.Width || md.Height != rd.Height) {
+		if (s_mirror_tex) s_mirror_tex->Release();
+		if (s_mirror_depth) s_mirror_depth->Release();
+		s_mirror_tex = nullptr;
+		s_mirror_depth = nullptr;
+		if (FAILED(s_dev->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &s_mirror_tex, nullptr)) ||
+		    FAILED(s_dev->CreateDepthStencilSurface(rd.Width, rd.Height, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, TRUE, &s_mirror_depth, nullptr))) {
+			log_info("mm7fx: mirror target %ux%u failed", rd.Width, rd.Height);
+			if (s_mirror_tex) s_mirror_tex->Release();
+			s_mirror_tex = nullptr;
+			s_mirror_init_failed = true; // don't retry every frame
+			return false;
+		}
+		log_info("mm7fx: mirror target %ux%u", rd.Width, rd.Height);
+	}
+
+	// one triangle list per texture
+	s_mir_order.resize(s_mir_polys.size());
+	for (uint32_t i = 0; i < s_mir_order.size(); ++i)
+		s_mir_order[i] = i;
+	std::sort(s_mir_order.begin(), s_mir_order.end(), [](uint32_t a, uint32_t b) { return s_mir_polys[a].tex < s_mir_polys[b].tex; });
+	s_mir_tris.clear();
+
+	IDirect3DSurface9 *mrt = nullptr, *prev_ds = nullptr;
+	s_mirror_tex->GetSurfaceLevel(0, &mrt);
+	s_dev->GetDepthStencilSurface(&prev_ds);
+	s_dev->SetRenderTarget(0, mrt);
+	s_dev->SetDepthStencilSurface(s_mirror_depth);
+	s_dev->SetViewport(&s_game_vp);
+	s_dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0);
+	const float zn = 16.0f, zf = 65536.0f;
+	const float vc[24] = {nrm[0], nrm[1], nrm[2], d, ax, bx, ay, by,
+	                      s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1],
+	                      s_dxw_off[0], s_dxw_off[1], s_dxw_off[2], s_dxw_off[3],
+	                      s_dxw_mul[0], s_dxw_mul[1], s_dxw_mul[2], s_dxw_mul[3], zn, zf / (zf - zn), 0, 0};
+	s_dev->SetVertexShaderConstantF(0, vc, 6);
+	s_dev->SetVertexShader(s_mirror_vs);
+	s_dev->SetPixelShader(s_mirror_ps);
+	s_dev->SetVertexDeclaration(s_mirror_decl);
+	s_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+	s_dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+	s_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+	s_dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+	s_dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+	s_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	s_dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+	s_dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+	s_dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+	s_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	s_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	s_dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+	auto flush = [&](IDirect3DBaseTexture9 *tex) {
+		if (s_mir_tris.empty())
+			return;
+		s_dev->SetTexture(0, tex);
+		constexpr size_t chunk = 3 * 20000;
+		for (size_t i = 0; i < s_mir_tris.size(); i += chunk) {
+			const size_t cnt = std::min(chunk, s_mir_tris.size() - i);
+			s_dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, static_cast<UINT>(cnt / 3), &s_mir_tris[i], sizeof(MirrorVertex));
+		}
+		s_mir_tris.clear();
+	};
+	IDirect3DBaseTexture9 *cur = nullptr;
+	for (uint32_t idx : s_mir_order) {
+		const MirrorPoly &p = s_mir_polys[idx];
+		if (p.tex != cur) {
+			flush(cur);
+			cur = p.tex;
+		}
+		const MirrorVertex *v = &s_mir_verts[p.first];
+		for (uint32_t k = 2; k < p.count; ++k) { // fan -> list
+			s_mir_tris.push_back(v[0]);
+			s_mir_tris.push_back(v[k - 1]);
+			s_mir_tris.push_back(v[k]);
+		}
+	}
+	flush(cur);
+
+	s_dev->SetDepthStencilSurface(prev_ds);
+	if (prev_ds) prev_ds->Release();
+	mrt->Release();
+	s_state->Apply();
+	static DWORD last = 0;
+	if (GetTickCount() - last > 5000) {
+		last = GetTickCount();
+		log_info("mm7fx dbg: mirror %zu polys, proj x %.1f%+.1f*y/x y %.1f%+.1f*z/x, plane n (%.3f %.3f %.3f) d %.1f",
+			s_mir_polys.size(), ax, bx, ay, by, nrm[0], nrm[1], nrm[2], d);
+	}
+	return true;
+}
+
 // Draws all captured water in one batch. Called right before the game draws buildings: all terrain is
 // already in the depth buffer, buildings/ships come after (as in vanilla, where water precedes them).
 static void draw_water_batch()
@@ -488,6 +854,8 @@ static void draw_water_batch()
 	                       s_dxw_mul[0], s_dxw_mul[1], s_dxw_mul[2], s_dxw_mul[3]};
 	IDirect3DSurface9 *prev_rt = nullptr;
 	s_dev->GetRenderTarget(0, &prev_rt);
+	const bool planar = mirror_render();
+	const float mirc[4] = {planar ? 1.0f : 0.0f, s_mode == Mode::DebugReflection ? 1.0f : 0.0f, 0, 0};
 	s_dev->SetRenderTarget(0, s_game_rt);
 	s_dev->SetViewport(&vp);
 	s_dev->SetVertexShader(s_water_vs);
@@ -500,6 +868,7 @@ static void draw_water_batch()
 	const float gfc[4] = {s_gf_mul[0], s_gf_mul[1], s_gf_add[0], s_gf_add[1]};
 	s_dev->SetVertexShaderConstantF(2, gfc, 1);
 	s_dev->SetPixelShaderConstantF(6, gfc, 1);
+	s_dev->SetPixelShaderConstantF(7, mirc, 1);
 	// same depth setup the game used for its water (it may be a W-buffer)
 	s_dev->SetRenderState(D3DRS_ZENABLE, s_mode == Mode::DebugSolid ? D3DZB_FALSE : s_game_zenable); // debug: no depth test
 	s_dev->SetRenderState(D3DRS_ZWRITEENABLE, s_game_zwrite);
@@ -508,7 +877,12 @@ static void draw_water_batch()
 	s_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 	s_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
 	s_dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-	s_dev->SetTexture(0, s_scene_tex);
+	s_dev->SetTexture(0, planar ? s_sky_tex : s_scene_tex);
+	s_dev->SetTexture(2, planar ? s_mirror_tex : nullptr);
+	s_dev->SetSamplerState(2, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	s_dev->SetSamplerState(2, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	s_dev->SetSamplerState(2, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	s_dev->SetSamplerState(2, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 	s_dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 	s_dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 	s_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -565,9 +939,11 @@ static void __fastcall hook_draw_terrain_polygon(void *self, void *edx, uint32_t
 	s_current_poly = poly;
 	s_current_n = n;
 	s_poly_captured = false;
+	mirror_begin(n);
 	s_orig_draw_terrain_polygon(self, edx, n, poly, tex, transparent, clamp);
+	mirror_end(poly);
 	// TL array now holds this tile's final vertices, independent of when draw events fired.
-	if (s_poly_captured && (s_mode == Mode::Effect || s_mode == Mode::DebugSolid))
+	if (s_poly_captured && mirror_wanted())
 		capture_water_poly();
 	if (s_poly_tex) {
 		s_poly_tex->Release();
@@ -581,7 +957,18 @@ static DrawBuildingsFn s_orig_draw_buildings = nullptr;
 
 static void __fastcall hook_draw_buildings(void *self, void *edx)
 {
+	s_sky_pending = mirror_wanted(); // sky is drawn, buildings and terrain follow: copy at their first draw
 	s_orig_draw_buildings(self, edx);
+}
+
+using DrawPolygonFn = void(__fastcall *)(void *self, void *edx, uint32_t n, uint8_t *poly, void *face, void *tex);
+static DrawPolygonFn s_orig_draw_polygon = nullptr;
+
+static void __fastcall hook_draw_polygon(void *self, void *edx, uint32_t n, uint8_t *poly, void *face, void *tex)
+{
+	mirror_begin(n);
+	s_orig_draw_polygon(self, edx, n, poly, face, tex);
+	mirror_end(poly);
 }
 
 using EndSceneFn = void(__fastcall *)(void *self, void *edx);
@@ -591,12 +978,13 @@ static void __fastcall hook_end_scene(void *self, void *edx)
 {
 	if (*reinterpret_cast<int *>(static_cast<uint8_t *>(self) + mm7::RenderSceneDepth) == 1) {
 		// Vanilla order is sky -> buildings -> terrain, so water goes after all terrain, before billboards.
-		if (s_dev && (s_mode == Mode::Effect || s_mode == Mode::DebugSolid)) {
+		if (s_dev && mirror_wanted()) {
 			draw_water_batch();
 			// Full 3D scene: next frame's reflection source.
 			s_scene_ready = copy_scene();
 		}
 		release_captured();
+		mirror_release_captured();
 	}
 	s_orig_end_scene(self, edx);
 }
@@ -615,6 +1003,7 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 	++s_draws;
 	if (!s_dev)
 		s_dev = reinterpret_cast<IDirect3DDevice9 *>(static_cast<uintptr_t>(cmd->get_device()->get_native()));
+	mirror_on_draw();
 	if (!s_current_poly)
 		return false;
 	++s_terrain_draws;
@@ -625,6 +1014,7 @@ static bool on_draw(command_list *cmd, uint32_t vertex_count, uint32_t, uint32_t
 	++s_water_draws;
 	switch (s_mode) {
 	case Mode::DebugSolid:
+	case Mode::DebugReflection:
 	case Mode::Effect:
 		if (s_dbg_left) {
 			--s_dbg_left;
@@ -670,13 +1060,14 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
 	}
 	s_f10_was_down = f10;
 
-	// Scriptable override: mm7fx_mode.txt in the game folder holds the mode number (0..3); checked twice a second.
+	// Scriptable override: mm7fx_mode.txt in the game folder holds the mode number (0..5; 4 = debug solid,
+	// 5 = reflection only); checked twice a second.
 	static DWORD last_poll = 0;
 	if (GetTickCount() - last_poll > 500) {
 		last_poll = GetTickCount();
 		if (FILE *f = std::fopen("mm7fx_mode.txt", "r")) {
 			int m = -1;
-			if (std::fscanf(f, "%d", &m) == 1 && m >= 0 && m <= 4 && m != static_cast<int>(s_mode)) {
+			if (std::fscanf(f, "%d", &m) == 1 && m >= 0 && m <= 5 && m != static_cast<int>(s_mode)) {
 				s_mode = static_cast<Mode>(m);
 				log_info("mm7fx: mode = %d (from mm7fx_mode.txt)", m);
 			}
@@ -700,11 +1091,13 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
 	}
 	s_water_drawn_this_frame = false;
 	release_captured(); // safety: never carry captures across frames
+	mirror_release_captured();
 }
 
 static void on_destroy_device(device *)
 {
 	release_captured();
+	release_mirror_resources();
 	if (s_state) s_state->Release();
 	if (s_water_ps) s_water_ps->Release();
 	if (s_water_vs) s_water_vs->Release();
@@ -739,6 +1132,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 			log_info("mm7fx: hooked DrawBuildingsD3D");
 		else
 			log_info("mm7fx: DrawBuildingsD3D prologue mismatch");
+		if (install_detour(mm7::DrawPolygon, mm7::DrawPolygonPrologue,
+				reinterpret_cast<void *>(hook_draw_polygon), reinterpret_cast<void **>(&s_orig_draw_polygon)))
+			log_info("mm7fx: hooked DrawPolygon");
+		else
+			log_info("mm7fx: DrawPolygon prologue mismatch, buildings not mirrored");
 		if (install_detour(mm7::EndSceneBillboards, mm7::EndSceneBillboardsPrologue,
 				reinterpret_cast<void *>(hook_end_scene), reinterpret_cast<void **>(&s_orig_end_scene)))
 			log_info("mm7fx: hooked DrawBillboards_And_..._EndScene");
